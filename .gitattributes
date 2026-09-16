@@ -1,0 +1,17 @@
+# 默认按内容自动判定文本/二进制
+* text=auto
+
+# 这几类必须是 LF：CRLF 的 shell 脚本在 Linux 上会报
+# "bad interpreter: /usr/bin/env bash^M"，而部署目标是 Linux
+*.sh   text eol=lf
+*.py   text eol=lf
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.css  text eol=lf
+*.html text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+
+# 二进制产物，不做任何行尾转换
+*.wasm binary
+*.task binary

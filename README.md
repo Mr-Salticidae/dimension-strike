@@ -22,7 +22,25 @@ bash fetch-assets.sh && python serve.py 8123
 运行时和手势识别模型。脚本幂等，已存在就跳过。**不跑它页面也能开**——星球、滑块、
 两种打击效果全部可用，只有摄像头手势会报「不可用」。
 
-## 部署
+## 线上地址
+
+**https://mr-salticidae.github.io/dimension-strike/**
+
+GitHub Pages，`gh-pages` 分支根目录，强制 HTTPS（摄像头可用）。更新站点：
+
+```bash
+bash fetch-assets.sh && bash deploy.sh
+```
+
+`deploy.sh` 把当前目录连同二进制产物一并推到 `gh-pages`——那些文件在 main 里被
+`.gitignore` 排除，而 Pages 没有构建步骤可以跑 `fetch-assets.sh`，只能由部署分支带着。
+
+Pages 自己就把下面第 1、3 条办妥了：`.js`/`.mjs` 回 `text/javascript`、`.wasm` 回
+`application/wasm`，gzip 默认开着（9.5MB 的 WASM 实际传 2.9MB）。唯一办不到的是自定义
+响应头，所以 COOP/COEP 那对跨源隔离头没有，MediaPipe 会走 XNNPACK 而非 GPU delegate ——
+手势识别照常工作，只是吃 CPU。
+
+## 部署（其他环境）
 
 拷贝整个目录到任意 Web 服务器即可，但有三件事必须确认：
 
