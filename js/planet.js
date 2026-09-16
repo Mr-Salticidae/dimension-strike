@@ -216,38 +216,80 @@ void main(){
   if(!gl_FrontFacing) N = -N;               // 断面朝外时法线要翻过来
   float lat = abs(n0.y);
 
-  vec3  base  = texture2D(uDay, uv).rgb;
-  float water = texture2D(uSpec, uv).r;
+  vec3  base   = texture2D(uDay, uv).rgb;
+  float water  = texture2D(uSpec, uv).r;
+  float relief = dot(base, vec3(0.299, 0.587, 0.114));
 
-  // ── 冰盖：低温时从两极推进。水面结整片冰，陆地积雪。
-  float freeze  = smoothstep(296.0, 214.0, uTempLag.x);
-  float iceLine = mix(1.16, -0.12, freeze);
-  float ice     = smoothstep(iceLine - 0.13, iceLine + 0.02, lat) * freeze;
-  // 冰的反照率保持在 bloom 阈值（1.10）之下，否则整颗雪球一起溢出成白板。
-  vec3  iceCol  = mix(vec3(0.640,0.672,0.706), vec3(0.706,0.740,0.782), water);
-  // 底图的明暗透一点上来，山脉和冰裂在雪原下仍可辨认
-  float relief  = dot(base, vec3(0.299, 0.587, 0.114));
-  iceCol *= 0.86 + relief * 0.42;
+  // 两张共用的噪声场：低频定斑块，中频打碎边缘。
+  // 温度效果最容易露馅的地方不是配色，是「整颗星按同一条曲线一起变」——
+  // 真实的相变有前沿、有先后、有参差，下面四段都是在给它们补这个。
+  float nLow = fbm3(n0 * 3.4) * 0.5 + 0.5;
+  float nMid = fbm3(n0 * 6.1) * 0.5 + 0.5;
+
+  // ── 冰盖：低温时从两极推进
+  float freeze = smoothstep(296.0, 214.0, uTempLag.x);
+  // 冰缘不是一条纬线。三件事把它拉开：噪声打碎边界；海面先冻（薄冰铺得快，
+  // 陆地冰盖要靠积雪一层层堆）；干而亮的高地与荒漠辐射降温最快，也先白。
+  float alt     = clamp((relief - 0.44) * 2.2, 0.0, 1.0) * (1.0 - water);
+  float iceLine = mix(1.16, -0.12, freeze)
+                + (nLow - 0.5) * 0.17 + (nMid - 0.5) * 0.06
+                - water * 0.13 - alt * 0.10;
+  float ice     = smoothstep(iceLine - 0.10, iceLine + 0.05, lat) * freeze;
+  // 海冰的边缘是碎的。只在过渡带里掺高频噪声——(1-|2i-1|) 在 i=0.5 处最大、
+  // 两端归零，所以冰盖内部和开阔水面都不受影响，碎的只有交界那一圈浮冰。
+  // 陆地不参与：积雪的边界本来就比海冰整齐。
+  float floe = snoise(n0 * 24.0) * 0.5 + 0.5;
+  ice = clamp(ice + (floe - 0.5) * 1.15 * (1.0 - abs(ice * 2.0 - 1.0)) * water, 0.0, 1.0);
+  // 海冰平坦偏青灰，陆雪亮而有起伏。反照率压在 bloom 阈值（1.10）之下，
+  // 否则整颗雪球一起溢出成白板。
+  vec3  seaIce  = vec3(0.612, 0.664, 0.716);
+  vec3  snow    = vec3(0.716, 0.742, 0.776) * (0.88 + nMid * 0.16);
+  vec3  iceCol  = mix(snow, seaIce, water);
+  iceCol *= 0.86 + relief * 0.42;   // 底图的明暗透一点上来，雪原下仍辨得出山脉
   base = mix(base, iceCol, ice * 0.94);
 
-  // ── 荒漠化：靠绿通道占优识别植被，升温后褪成沙色
-  float veg  = clamp((base.g - (base.r + base.b) * 0.5) * 4.2, 0.0, 1.0);
+  // ── 荒漠化：升温后植被褪成沙色
+  float veg = clamp((base.g - (base.r + base.b) * 0.5) * 4.2, 0.0, 1.0);
+  // 不是全球一起褪。副热带是哈德里环流的下沉支，最先干；赤道雨林水汽最足，
+  // 最后才垮。再乘一层斑块噪声，干旱前沿因此是啃出来的，不是推平的。
+  float belt = smoothstep(0.10, 0.40, lat) * (1.0 - smoothstep(0.60, 0.94, lat));
   float arid = smoothstep(292.0, 402.0, uTempLag.y);
-  base = mix(base, vec3(0.560, 0.452, 0.298), arid * veg * (1.0 - water) * 0.92);
+  arid = clamp(arid * (0.42 + 0.88 * belt) * (0.52 + 0.80 * nLow), 0.0, 1.0);
+  vec3 sand = mix(vec3(0.470, 0.392, 0.286), vec3(0.624, 0.498, 0.322), nMid);
+  base = mix(base, sand, arid * veg * (1.0 - water) * 0.92);
 
-  // ── 海洋蒸干，露出海床
-  float boil = smoothstep(368.0, 452.0, uTempLag.z);
-  base = mix(base, vec3(0.132, 0.114, 0.098), water * boil);
+  // ── 海洋蒸干：先退浅海，再退深海
+  // 近岸判定靠对水体遮罩做四点采样，邻域里出现陆地就是浅水。均匀地把整片海
+  // 压暗，读起来是海水在褪色；先露大陆架再露海盆，才是海在退去。
+  // 浅海和深海各走一条曲线：浅的先干，深的晚干，但两条最终都会到 1。
+  // 早先只有一条曲线再按水深打折，结果深海盆无论多热都只干掉四成——
+  // 温度拉满还剩一片蓝，那才是最假的。
+  float boilShallow = smoothstep(362.0, 438.0, uTempLag.z);
+  float boilDeep    = smoothstep(424.0, 516.0, uTempLag.z);
+  float e = 0.010;
+  float near = texture2D(uSpec, uv + vec2( e, 0.0)).r
+             + texture2D(uSpec, uv + vec2(-e, 0.0)).r
+             + texture2D(uSpec, uv + vec2(0.0,  e)).r
+             + texture2D(uSpec, uv + vec2(0.0, -e)).r;
+  float shelf = 1.0 - near * 0.25;                       // 0 = 深海盆，1 = 岸边
+  float dry   = mix(boilDeep, boilShallow, shelf);
+  vec3  bed   = mix(vec3(0.088, 0.076, 0.068), vec3(0.186, 0.158, 0.132),
+                    shelf * (0.45 + 0.55 * nMid));
+  base = mix(base, bed, water * dry);
 
-  // ── 熔融：程序化岩浆裂缝
-  float melt   = smoothstep(620.0, 900.0, uTempLag.w);
-  float ridge  = 1.0 - abs(fbm3(n0 * 3.1)) * 1.7;
-  float cracks = pow(clamp(ridge, 0.0, 1.0), 6.0);
+  // ── 熔融：裂缝先出现，再变宽，最后连成岩浆海
+  float melt  = smoothstep(620.0, 900.0, uTempLag.w);
+  float ridge = 1.0 - abs(fbm3(n0 * 3.1)) * 1.7;
+  // 指数随熔融程度下降：细缝 → 宽缝 → 连片。固定指数下岩浆从头到尾一样粗，
+  // 只是越来越亮——那不是在熔化，是在调亮度。
+  float cracks = pow(clamp(ridge, 0.0, 1.0), mix(11.0, 3.4, melt));
   vec3  magma  = mix(vec3(0.120,0.024,0.010), vec3(1.000,0.398,0.098), cracks);
+  // 白热只留给真正接近全熔的那一段。给早了，八百度就糊成一颗恒星。
+  magma = mix(magma, vec3(1.000, 0.664, 0.302), cracks * smoothstep(0.80, 1.0, melt));
   base = mix(base, magma * 0.30, melt);
   vec3 emissive = magma * cracks * melt * 3.2;      // >1 交给 bloom
 
-  float wet = water * (1.0 - boil) * (1.0 - ice);   // 当前仍是液态水的部分
+  float wet = water * (1.0 - dry) * (1.0 - ice);    // 当前仍是液态水的部分
 
   // ── 光照。网格不转，所以世界系法线可直接对太阳。
   vec3 L = normalize(uLightDir);
@@ -1185,7 +1227,11 @@ export class PlanetStage {
     const pc = Math.min(1, Math.pow(pressureAtm / 9, 0.60));
     const tk = Math.min(1, Math.max(0, (tempK - 150) / 120)) *
                Math.min(1, Math.max(0, (760 - tempK) / 180));
-    t.cover = pc * (0.25 + 0.75 * tk);
+    // 海水蒸干的那一段，蒸汽会先把整颗星裹起来，再随高温散掉。
+    // 少了这一步，海洋就是「悄悄变暗」——水去哪了？
+    const steam = Math.min(1, Math.max(0, (tempK - 362) / 70)) *
+                  Math.min(1, Math.max(0, (560 - tempK) / 130));
+    t.cover = Math.min(1, pc * (0.25 + 0.75 * tk) + steam * 0.55);
     t.ctint = Math.min(1, Math.max(0, (tempK - 340) / 260));
 
     t.density = Math.min(2.2, Math.pow(pressureAtm / 1.2, 0.55) * 0.80);
