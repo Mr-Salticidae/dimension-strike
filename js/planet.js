@@ -252,6 +252,21 @@ void main(){
   vec3 flatLit = mix(base, vec3(lum), 0.26) * 1.42 + emissive * 0.55;
   lit = mix(lit, flatLit, vFlat);
 
+  // ── 塌缩前沿。这一击的光来自物质本身失去一个维度时放出的能量，
+  // 不是箔片在发光——所以它长在球面上、跟着曲率走，而不是浮在画面前。
+  // vFlat 的过渡带就是前沿，取其峰值；必须叠在上面那次 mix 之后，
+  // 否则会被压平后的无光配色稀释掉。
+  if(vFlat > 0.001 && vFlat < 0.999){
+    // 指数取高是为了把前沿收窄：过渡带本身有 0.6 个半径宽，直接用
+    // 它的峰值会糊成一片，bloom 再一摊就是块白板。
+    float front = pow(vFlat * (1.0 - vFlat) * 4.0, 7.0);
+    // 物质不是均匀地塌缩，前沿因此是撕裂的而不是一条干净的线
+    float grain = 0.30 + 0.70 * (fbm3(n0 * 16.0) * 0.5 + 0.5);
+    // 红通道必须压在 1 以下。三个通道一起过 1，ACES 一压就是白——
+    // 「蓝色的强光」和「白光」的区别全在这里，不在亮度。
+    lit += vec3(0.12, 0.42, 1.00) * front * grain * 2.2;  // >1 交给 bloom
+  }
+
   // ── 引力挤压：碎片带着塌缩余温，挂在分离度上而非总进度
   if(uShatter > 0.0){
     float burst = smoothstep(0.20, 1.0, uShatter);
@@ -421,17 +436,44 @@ void main(){
 }
 `;
 
+// 箔片本身几乎不发光——真正的光在行星表面的塌缩前沿（见 PLANET_FRAG）。
+// 一个二维物体不该有可见的厚度梯度，所以这里不做柔和的辉光带：中线是一条
+// 极窄的硬线，两侧是它扰动光路留下的干涉彩边。早先那版是 pow 5 的对称白带，
+// 芯部直接顶到纯白 —— 读起来是一根光棒，不是一片零厚度的东西。
 const FOIL_FRAG = `
 precision highp float;
 uniform float uOpacity;
+uniform float uTime;
+uniform float uCut;     // 箔片当前位置处行星截面的半径，0 = 已经切出去了
 varying vec2 vUv;
+
+// 薄膜干涉的廉价近似：相位决定被增强的波长。彩边是它唯一能被看见的方式。
+vec3 spectrum(float t){
+  return 0.5 + 0.5 * cos(6.2831853 * (t + vec3(0.0, 0.33, 0.67)));
+}
+
 void main(){
-  float band = 1.0 - abs(vUv.x - 0.5) * 2.0;
-  band = pow(clamp(band, 0.0, 1.0), 5.0);
-  float fade = smoothstep(0.0, 0.16, vUv.y) * smoothstep(1.0, 0.84, vUv.y);
-  float a = band * fade * uOpacity;
-  vec3 col = mix(vec3(0.44, 0.66, 0.86), vec3(1.0, 1.0, 1.0), band);
-  gl_FragColor = vec4(col * a * 1.6, a);
+  float d = abs(vUv.x - 0.5) * 2.0;
+  float k = clamp(1.0 - d, 0.0, 1.0);
+
+  float core   = pow(k, 46.0);                 // 中线：窄到几乎没有过渡
+  float phase  = d * 11.0 - uTime * 0.8;
+  float fringe = pow(k, 3.4) * (0.5 + 0.5 * cos(phase * 6.2831853)) * 0.34;
+
+  // 只有正切进物质的那一段才亮。真空里它没有东西可作用，
+  // 一根贯穿整个画面、亮度还均匀的光棒，是「廉价」最直接的来源。
+  float hy    = abs(vUv.y - 0.5) * 5.6;        // 平面局部坐标即世界 Y
+  float cut   = smoothstep(uCut + 0.30, uCut - 0.02, hy);
+  float trace = 0.07 + 0.93 * cut;             // 截面外只留一丝痕迹
+
+  float fade = smoothstep(0.0, 0.10, vUv.y) * smoothstep(1.0, 0.90, vUv.y);
+  float a = (core + fringe) * fade * trace * uOpacity;
+
+  // 冷蓝，不给纯白：纯白 + 加性混合 = 一块曝掉的板子。
+  // 颜色叙事里冷蓝属于观测者，这一击本来就是观测者的手笔。
+  vec3 col = vec3(0.30, 0.62, 1.15) * core * 2.2
+           + spectrum(phase * 0.5) * fringe * 1.4;
+  gl_FragColor = vec4(col, a);
 }
 `;
 
@@ -706,10 +748,12 @@ export class PlanetStage {
 
   _buildFoil(){
     const geo = new THREE.PlaneGeometry(3.2, 5.6);
-    this.uFoil = { uOpacity:{value:0} };
+    this.uFoil = { uOpacity:{value:0}, uTime:{value:0}, uCut:{value:0} };
+    // depthTest 必须开。关掉它箔片就画在所有东西之上，永远不会被行星挡住——
+    // 那是「贴在画面上的一道光」和「场景里的一个东西」之间最直接的区别。
     this.foil = new THREE.Mesh(geo, new THREE.ShaderMaterial({
       uniforms:this.uFoil, vertexShader:FOIL_VERT, fragmentShader:FOIL_FRAG,
-      transparent:true, depthWrite:false, depthTest:false,
+      transparent:true, depthWrite:false, depthTest:true,
       blending:THREE.AdditiveBlending, side:THREE.DoubleSide
     }));
     this.foil.rotation.y = Math.PI / 2;   // YZ 平面，沿 X 扫掠
@@ -844,6 +888,9 @@ export class PlanetStage {
       // 大气随压平进程整体淡出：二维空间里没有大气层
       this.uAtmo.uFade.value = 1 - this._ss(0.0, 0.62, t);
       this.foil.position.x = x;
+      this.uFoil.uTime.value = this.effectT;
+      // 箔片在这个位置切到的截面半径。切出行星之后它就没东西可作用了。
+      this.uFoil.uCut.value = Math.sqrt(Math.max(0, 1 - x * x));
       this.uFoil.uOpacity.value = Math.sin(Math.min(1, t * 1.12) * Math.PI) * 0.78;
 
       // 箔片压过行星期间的持续低鸣。它不是撞击，是那块空间在塌缩。
