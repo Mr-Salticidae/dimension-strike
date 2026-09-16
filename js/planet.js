@@ -98,7 +98,14 @@ vec3 flatten(vec3 p, out float outFlat){
 // 导数在两端归零——所有碎片同时起步、同时刹停，那是整个效果里最假的一处。
 // 断裂是瞬时冲量；此后真空中没有阻力，速度只被残核引力削减，于是慢的会落回、
 // 快的一去不返。这条长尾是免费的，只要别把位移直接插值。
-vec3 deform(vec3 p, vec3 cen, vec3 dir, vec3 axis, float rnd, out float outFlat){
+vec3 rotAxis(vec3 v, vec3 axis, float c, float s){
+  return v * c + cross(axis, v) * s + axis * dot(axis, v) * (1.0 - c);
+}
+
+vec3 deform(vec3 p, vec3 cen, vec3 dir, vec3 axis, float rnd, float mass,
+            out float outFlat, out vec3 outNrm, out float outBurst){
+  outNrm = normalize(p);     // 未形变时，球面法线就是方向本身
+  outBurst = 0.0;
   p = flatten(p, outFlat);
 
   if(uShatter > 0.0){
@@ -116,14 +123,18 @@ vec3 deform(vec3 p, vec3 cen, vec3 dir, vec3 axis, float rnd, out float outFlat)
 
     float tb = s - tFrac;
     if(tb > 0.0){
+      outBurst = tb;
       vec3 local = p - cen;
       // 绕独立随机轴匀速翻滚——真空里没有东西让它慢下来。若沿用飞散方向
       // 作转轴，碎片只会绕飞行轴自旋、始终正对镜头，看起来是一地彩纸屑。
-      float ang = (rnd * 2.0 - 1.0) * 17.0 * tb;
+      // 大块转得慢：同样的冲量矩，转动惯量大就是转不动。
+      float ang = (rnd * 2.0 - 1.0) * 17.0 * mix(1.55, 0.40, mass) * tb;
       float c = cos(ang), si = sin(ang);
-      local = local * c + cross(axis, local) * si + axis * dot(axis, local) * (1.0 - c);
-      // 初速离散：rnd 三次方拉长尾。二次项是残核引力，慢碎片会被拉回来。
-      float v0   = 0.42 + rnd * rnd * rnd * 3.4;
+      local  = rotAxis(local,  axis, c, si);
+      outNrm = rotAxis(outNrm, axis, c, si);   // 法线必须跟着碎片一起转
+      // 初速离散：rnd 三次方拉长尾，再按质量分配——同一份冲量，小块飞得快。
+      // 二次项是残核引力，慢碎片会被拉回来。
+      float v0   = (0.42 + rnd * rnd * rnd * 3.4) * mix(1.50, 0.52, mass);
       float disp = max(0.0, v0 * tb - 0.34 * tb * tb);
       p = cen + local + dir * disp;
     }
@@ -139,20 +150,28 @@ attribute vec3 aCentroid;
 attribute vec3 aDir;
 attribute vec3 aAxis;
 attribute float aRnd;
+attribute float aMass;
 
 varying vec2 vUv;
 varying vec3 vSurf;
+varying vec3 vNrm;
+varying vec3 vPos;
 varying float vFlat;
+varying float vBurst;
 
 ${DEFORM}
 
 void main(){
   vUv   = uv;
-  vSurf = normalize(position);   // 未形变方向：碎裂时贴图不随碎片滑移
+  vSurf = normalize(position);   // 未形变方向：贴图与地表属性都按它取，碎裂时才不会滑移
 
-  float f;
-  vec3 p = deform(position, aCentroid, aDir, aAxis, aRnd, f);
-  vFlat = f;
+  float f, burst;
+  vec3 nrm;
+  vec3 p = deform(position, aCentroid, aDir, aAxis, aRnd, aMass, f, nrm, burst);
+  vFlat  = f;
+  vNrm   = nrm;                  // 受光用它：翻滚的碎片必须跟着变明暗
+  vPos   = p;                    // 网格无变换，物体空间即世界空间
+  vBurst = burst;
 
   gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
 }
@@ -177,13 +196,20 @@ uniform vec3  uLightDir;
 
 varying vec2 vUv;
 varying vec3 vSurf;
+varying vec3 vNrm;
+varying vec3 vPos;
 varying float vFlat;
+varying float vBurst;
 
 ${NOISE}
 
 void main(){
   vec2 uv = vec2(vUv.x + uSpinUV, vUv.y);   // RepeatWrapping 负责环绕
+  // n0 是地表属性的坐标（冰按纬度、岩浆按噪声），不随碎片翻滚；
+  // N 是受光法线，必须跟着翻滚——这两者分开是碎片能「活」起来的前提。
   vec3 n0 = normalize(vSurf);
+  vec3 N  = normalize(vNrm);
+  if(!gl_FrontFacing) N = -N;               // 断面朝外时法线要翻过来
   float lat = abs(n0.y);
 
   vec3  base  = texture2D(uDay, uv).rgb;
@@ -221,7 +247,7 @@ void main(){
 
   // ── 光照。网格不转，所以世界系法线可直接对太阳。
   vec3 L = normalize(uLightDir);
-  float ndl = dot(n0, L);
+  float ndl = dot(N, L);
   float day = smoothstep(-0.06, 0.14, ndl);
 
   // 云影：沿光方向在 UV 上略偏移采样同一张云图
@@ -236,9 +262,9 @@ void main(){
   lit += base * vec3(0.034, 0.044, 0.066) * (1.0 - day);   // 夜面天光，别压死成纯黑
 
   // ── 海洋太阳反射点
-  vec3 V = normalize(cameraPosition - vSurf);
+  vec3 V = normalize(cameraPosition - vPos);
   vec3 H = normalize(L + V);
-  float spec = pow(max(dot(n0, H), 0.0), 1100.0) * wet * smoothstep(-0.02, 0.16, ndl);
+  float spec = pow(max(dot(N, H), 0.0), 1100.0) * wet * smoothstep(-0.02, 0.16, ndl);
   lit += vec3(1.0, 0.95, 0.86) * spec * 1.9;               // >1 交给 bloom
 
   // ── 城市灯火：NASA 夜间灯光原图
@@ -267,14 +293,35 @@ void main(){
     lit += vec3(0.12, 0.42, 1.00) * front * grain * 2.2;  // >1 交给 bloom
   }
 
-  // ── 引力挤压：碎片带着塌缩余温，挂在分离度上而非总进度
+  // ── 引力挤压
   if(uShatter > 0.0){
-    float burst = smoothstep(0.20, 1.0, uShatter);
-    float heat  = smoothstep(0.02, 0.26, burst) * (1.0 - smoothstep(0.32, 0.92, burst));
+    // 余温挂在这块碎片自己的飞散时长上，不是全局进度——否则两千块同时
+    // 亮、同时灭，再好的飞散也会露馅。
+    float b     = vBurst;
+    float heat  = smoothstep(0.0, 0.04, b) * (1.0 - smoothstep(0.06, 0.34, b));
     float grain = fbm3(n0 * 7.0) * 0.5 + 0.5;
-    lit += vec3(1.0, 0.42, 0.14) * heat * (0.42 + 0.78 * grain) * 1.55;
-    lit *= 1.0 - smoothstep(0.0, 0.18, uShatter) * 0.35;
-    lit *= 1.0 - smoothstep(0.30, 0.95, burst) * 0.55;
+
+    // 热在断面上，不在地壳上。地壳该是什么颜色还是什么颜色——把余温均匀刷满
+    // 每一面，两千块碎片就会一起变成橙色的落叶。
+    if(!gl_FrontFacing){
+      // 背面是新剥出来的地幔：没有海陆没有云，只有岩石和地心带出来的温度。
+      // 早先材质是 FrontSide，碎片翻到背面直接被剔掉——薄片忽闪忽灭，
+      // 那比「像纸屑」更致命：它连个实体都不是。
+      float d = fbm3(n0 * 11.0) * 0.5 + 0.5;
+      vec3 rock = mix(vec3(0.052, 0.040, 0.036), vec3(0.128, 0.104, 0.092), d);
+      lit = rock * (0.22 + 0.92 * max(dot(N, L), 0.0))
+          + vec3(1.0, 0.36, 0.10) * heat * (0.40 + 0.80 * grain) * 1.75;
+    }else{
+      lit += vec3(1.0, 0.42, 0.14) * heat * grain * 0.20;   // 地壳面只沾一点：给多了海洋会泛紫
+    }
+
+    // 三角面没有厚度，掠射时会薄成一条线；真的石头这时候露出的是粗糙的侧面。
+    // 拿视角衰减补一道暗边，至少让它读起来有体积。
+    float edgeOn = 1.0 - abs(dot(N, V));
+    lit = mix(lit, lit * 0.22, pow(edgeOn, 4.0));
+
+    lit *= 1.0 - smoothstep(0.0, 0.18, uShatter) * 0.35;   // 塌缩期整体压暗
+    lit *= 1.0 - smoothstep(0.10, 0.80, b) * 0.55;         // 飞远之后冷下来
   }
 
   gl_FragColor = vec4(lit, 1.0);
@@ -520,6 +567,43 @@ const ENV_TAU = {
 // 因为它是「每帧走剩余距离的 10%」而不是「每秒衰减到 1/e」。
 const damp = (cur, tgt, tau, dt) => cur + (tgt - cur) * (1 - Math.exp(-dt / tau));
 
+/* ── 断裂图样 ──────────────────────────────────────────
+   把球面上的三角面归进碎块。早先是一面一片：两万个同样大小的三角，
+   飞散参数再怎么调也只能是一地彩纸屑——真实的断裂有尺寸谱。
+
+   做法是 Worley：空间切成网格，每格放一个抖动过的种子，取最近的那个。
+   等价于一次 Voronoi 剖分，但只需查 27 个邻格，不必和上千种子逐一比对
+   （那是两千万次点积，够在加载时卡掉一帧）。
+   两档网格密度由一层低频噪声挑选，于是有的区域裂成大板块、有的碎成渣，
+   断裂本来就是不均匀的。 */
+const _rand3 = (x, y, z, salt) => {
+  let h = (x * 374761393 + y * 668265263 + z * 1442695040 + salt * 2654435761) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+};
+
+function fractureCell(x, y, z){
+  // 低频场决定这一带是裂成板还是碎成渣
+  const gx = Math.floor(x * 1.6), gy = Math.floor(y * 1.6), gz = Math.floor(z * 1.6);
+  const scale = _rand3(gx, gy, gz, 7) < 0.42 ? 7.0 : 14.5;
+
+  const px = x * scale, py = y * scale, pz = z * scale;
+  const ix = Math.floor(px), iy = Math.floor(py), iz = Math.floor(pz);
+  let best = 1e9, bx = 0, by = 0, bz = 0;
+  for(let dx = -1; dx <= 1; dx++)
+    for(let dy = -1; dy <= 1; dy++)
+      for(let dz = -1; dz <= 1; dz++){
+        const cx = ix + dx, cy = iy + dy, cz = iz + dz;
+        const sx = cx + _rand3(cx, cy, cz, 1);
+        const sy = cy + _rand3(cx, cy, cz, 2);
+        const sz = cz + _rand3(cx, cy, cz, 3);
+        const d = (sx-px)*(sx-px) + (sy-py)*(sy-py) + (sz-pz)*(sz-pz);
+        if(d < best){ best = d; bx = cx; by = cy; bz = cz; }
+      }
+  // 两档网格的键必须分开，否则粗细两套格子会撞号
+  return (((bx + 64) * 181 + (by + 64)) * 181 + (bz + 64)) * 2 + (scale > 10 ? 1 : 0);
+}
+
 /* 命中停顿：断裂那一帧把时间几乎冻住，再放回。2.7 秒的挤压里最关键的
    就是那一下，匀速滑过去等于没发生。 */
 const STOP_HOLD = 0.13, STOP_RAMP = 0.24;
@@ -667,36 +751,63 @@ export class PlanetStage {
     const dir = new Float32Array(n * 3);
     const axis = new Float32Array(n * 3);
     const rnd = new Float32Array(n);
+    const mass = new Float32Array(n);
 
-    for(let t = 0; t < n; t += 3){
+    // 一遍：把每个三角面归进碎块，顺便攒出各块的形心和面数
+    const faces = n / 3;
+    const keyOf = new Int32Array(faces);
+    const tri = new Float32Array(faces * 3);
+    const blocks = new Map();
+    for(let t = 0, f = 0; t < n; t += 3, f++){
       let cx = 0, cy = 0, cz = 0;
       for(let k = 0; k < 3; k++){
         cx += pos.getX(t + k); cy += pos.getY(t + k); cz += pos.getZ(t + k);
       }
       cx /= 3; cy /= 3; cz /= 3;
+      tri[f*3] = cx; tri[f*3+1] = cy; tri[f*3+2] = cz;
 
-      let dx = cx + (Math.random() - 0.5) * 0.85;
-      let dy = cy + (Math.random() - 0.5) * 0.85;
-      let dz = cz + (Math.random() - 0.5) * 0.85;
+      const key = fractureCell(cx, cy, cz);
+      keyOf[f] = key;
+      let b = blocks.get(key);
+      if(!b){ b = { cx:0, cy:0, cz:0, c:0 }; blocks.set(key, b); }
+      b.cx += cx; b.cy += cy; b.cz += cz; b.c++;
+    }
+
+    // 二遍：每块算一次刚体属性，整块共用——这才是「一块碎片」的含义
+    for(const b of blocks.values()){
+      b.cx /= b.c; b.cy /= b.c; b.cz /= b.c;
+
+      let dx = b.cx + (Math.random() - 0.5) * 0.55;
+      let dy = b.cy + (Math.random() - 0.5) * 0.55;
+      let dz = b.cz + (Math.random() - 0.5) * 0.55;
       const L = Math.hypot(dx, dy, dz) || 1;
-      dx /= L; dy /= L; dz /= L;
+      b.dx = dx / L; b.dy = dy / L; b.dz = dz / L;
 
       let ax = Math.random() * 2 - 1, ay = Math.random() * 2 - 1, az = Math.random() * 2 - 1;
       const AL = Math.hypot(ax, ay, az) || 1;
-      ax /= AL; ay /= AL; az /= AL;
+      b.ax = ax / AL; b.ay = ay / AL; b.az = az / AL;
 
-      const r = Math.random();
+      b.rnd = Math.random();
+      // 质量代理：面数开方后归一。同一份冲量下，它决定这块被推得多快、转得多急。
+      b.mass = Math.min(1, Math.sqrt(b.c / 60));
+    }
+
+    for(let f = 0; f < faces; f++){
+      const b = blocks.get(keyOf[f]);
       for(let k = 0; k < 3; k++){
-        cen[(t+k)*3] = cx; cen[(t+k)*3+1] = cy; cen[(t+k)*3+2] = cz;
-        dir[(t+k)*3] = dx; dir[(t+k)*3+1] = dy; dir[(t+k)*3+2] = dz;
-        axis[(t+k)*3] = ax; axis[(t+k)*3+1] = ay; axis[(t+k)*3+2] = az;
-        rnd[t+k] = r;
+        const v = f * 3 + k;
+        cen[v*3] = b.cx; cen[v*3+1] = b.cy; cen[v*3+2] = b.cz;
+        dir[v*3] = b.dx; dir[v*3+1] = b.dy; dir[v*3+2] = b.dz;
+        axis[v*3] = b.ax; axis[v*3+1] = b.ay; axis[v*3+2] = b.az;
+        rnd[v] = b.rnd;
+        mass[v] = b.mass;
       }
     }
     geo.setAttribute('aCentroid', new THREE.BufferAttribute(cen, 3));
     geo.setAttribute('aDir', new THREE.BufferAttribute(dir, 3));
     geo.setAttribute('aAxis', new THREE.BufferAttribute(axis, 3));
     geo.setAttribute('aRnd', new THREE.BufferAttribute(rnd, 1));
+    geo.setAttribute('aMass', new THREE.BufferAttribute(mass, 1));
 
     this.uPlanet = {
       uDay:{value:this.tex.day}, uNight:{value:this.tex.night},
@@ -854,6 +965,9 @@ export class PlanetStage {
   triggerCrush(){
     if(this.state !== 'idle') return false;
     this.state = 'crush'; this.effectT = 0;
+    // 碎开之后才看得到断面。完整球体是闭合的，背面全被剔掉也无妨，
+    // 始终开双面等于白付一倍的片元着色。
+    this.planet.material.side = THREE.DoubleSide;
     return true;
   }
 
@@ -868,6 +982,7 @@ export class PlanetStage {
     this._placeFoil(-1.9);
     this.uCore.uOpacity.value = 0;
     this.core.visible = false;
+    this.planet.material.side = THREE.FrontSide;
     this.camAz = 0; this.camEl = 0; this.camPush = 0;
     this._applyCam();
   }
@@ -929,9 +1044,9 @@ export class PlanetStage {
         if(this.onShock) this.onShock();
       }
 
-      // 断裂后缓慢退开。碎片云比行星大得多，不退就只剩一屏纸屑；
-      // 这也是这一击唯一的镜头语言——做完了，然后往后站。
-      this.camPush = this._ss(0.17, 1.55, this.effectT) * 2.0;
+      // 断裂后退开，而且要退得比碎片云长得快——慢半拍就只剩一屏碎屑糊脸。
+      // 这也是这一击唯一的镜头语言：做完了，然后往后站。
+      this.camPush = this._ss(0.16, 0.95, this.effectT) * 2.40;
 
       // 内核必须等碎片开始分离才亮——提前亮就是在一颗完整球体前面糊一团白
       const op = this._ss(0.17, 0.30, t) * (1 - this._ss(0.34, 0.72, t)) * 0.82;
@@ -949,7 +1064,7 @@ export class PlanetStage {
       this.effectT += edt / 2.7;
       const v = Math.min(1.8, this.effectT);
       this.uPlanet.uShatter.value = this.uCloud.uShatter.value = v;
-      this.camPush = this._ss(0.17, 1.55, v) * 2.0;
+      this.camPush = 2.40 + this._ss(1.0, 1.8, v) * 1.20;
     }
 
     this._applyCam();
