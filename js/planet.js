@@ -12,6 +12,7 @@ import { EffectComposer }   from '../vendor/jsm/postprocessing/EffectComposer.js
 import { RenderPass }       from '../vendor/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass }  from '../vendor/jsm/postprocessing/UnrealBloomPass.js';
 import { OutputPass }       from '../vendor/jsm/postprocessing/OutputPass.js';
+import { ShaderPass }       from '../vendor/jsm/postprocessing/ShaderPass.js';
 
 /* ── 噪声（仅熔融裂缝还需要） ─────────────────────────── */
 
@@ -77,6 +78,8 @@ const DEFORM = `
 uniform float uFoilX;    // 二向箔扫掠位置（-1.9 → +1.9）
 uniform float uShatter;  // 挤压进度 0 → 1
 uniform float uSpread;   // 压平后铺开系数
+uniform vec2  uFracWin;  // 断裂时间窗（起点, 离散量）：地壳先裂，地幔后裂
+uniform float uBurstK;   // 飞散速度倍率：越往里越致密，飞得越慢
 
 float flatAmount(vec3 p){
   return smoothstep(uFoilX + 0.30, uFoilX - 0.30, p.x);
@@ -115,9 +118,9 @@ vec3 deform(vec3 p, vec3 cen, vec3 dir, vec3 axis, float rnd, float mass,
 
     // 裂纹不会同时到达每一处：每片有自己的断裂时刻，断裂前随整体塌缩、
     // 断裂后停止压缩。两者错开，塌缩末期的表面因此是碎的而不是光滑的。
-    float tFrac = 0.15 + r2 * 0.09;
+    float tFrac = uFracWin.x + r2 * uFracWin.y;
     float cs = min(s, tFrac);
-    float squeeze = pow(cs / 0.24, 2.4) * 0.26;   // 幂次：越塌缩引力越强
+    float squeeze = pow(cs / (uFracWin.x + uFracWin.y), 2.4) * 0.26;   // 幂次：越塌缩引力越强
     p   *= 1.0 - squeeze;
     cen *= 1.0 - squeeze;
 
@@ -134,7 +137,7 @@ vec3 deform(vec3 p, vec3 cen, vec3 dir, vec3 axis, float rnd, float mass,
       outNrm = rotAxis(outNrm, axis, c, si);   // 法线必须跟着碎片一起转
       // 初速离散：rnd 三次方拉长尾，再按质量分配——同一份冲量，小块飞得快。
       // 二次项是残核引力，慢碎片会被拉回来。
-      float v0   = (0.42 + rnd * rnd * rnd * 3.4) * mix(1.50, 0.52, mass);
+      float v0   = (0.42 + rnd * rnd * rnd * 3.4) * mix(1.50, 0.52, mass) * uBurstK;
       float disp = max(0.0, v0 * tb - 0.34 * tb * tb);
       p = cen + local + dir * disp;
     }
@@ -192,6 +195,7 @@ uniform float uPop;          // 0..1
 uniform float uSpinUV;       // 自转 = UV 横向偏移
 uniform float uShatter;
 uniform float uCover;        // 云量
+uniform float uCoreGlow;     // 内核亮度，用于照亮碎片内侧
 uniform vec3  uLightDir;
 
 varying vec2 vUv;
@@ -319,6 +323,12 @@ void main(){
     // 拿视角衰减补一道暗边，至少让它读起来有体积。
     float edgeOn = 1.0 - abs(dot(N, V));
     lit = mix(lit, lit * 0.22, pow(edgeOn, 4.0));
+
+    // 内核的照明。碎片内侧被它照亮，是「里面有东西」最直接的证据；
+    // 没有这道光，碎开的行星就只是一层被吹散的皮。
+    float cd = length(vPos);
+    float cl = max(dot(N, -vPos / max(cd, 1e-4)), 0.0);
+    lit += vec3(1.0, 0.44, 0.14) * cl * uCoreGlow / (0.30 + cd * cd);
 
     lit *= 1.0 - smoothstep(0.0, 0.18, uShatter) * 0.35;   // 塌缩期整体压暗
     lit *= 1.0 - smoothstep(0.10, 0.80, b) * 0.55;         // 飞远之后冷下来
@@ -473,7 +483,88 @@ void main(){
 }
 `;
 
-/* ── 二向箔与内核 ────────────────────────────────────── */
+/* ── 地幔与内核 ──────────────────────────────────────────
+   只有外壳碎开，里面是空的——那颗行星看着就是个气球。地幔和内核平时藏在
+   不透明的地壳后面，只在引力挤压时露出来：地幔比地壳晚裂、碎得更大更慢，
+   内核根本不裂，被压实、烧亮，最后作为余烬留在原地。
+   内核同时是碎片内侧的光源，「里面有东西」这件事主要靠那道光成立。 */
+
+const MANTLE_FRAG = `
+precision highp float;
+uniform vec3  uLightDir;
+uniform float uShatter;
+uniform float uCoreGlow;
+
+varying vec3 vSurf;
+varying vec3 vNrm;
+varying vec3 vPos;
+varying float vBurst;
+
+${NOISE}
+
+void main(){
+  vec3 n0 = normalize(vSurf);
+  vec3 N  = normalize(vNrm);
+  if(!gl_FrontFacing) N = -N;
+
+  float d     = fbm3(n0 * 5.5) * 0.5 + 0.5;
+  // 系数决定「缝」有多宽。取 1.9 会让 ridge 几乎处处为正——那不是裂缝，
+  // 那是整颗球在发光。要的是窄缝，所以系数要大、指数要高。
+  float ridge = 1.0 - abs(fbm3(n0 * 3.4)) * 3.4;
+  float vein  = pow(clamp(ridge, 0.0, 1.0), 6.0);
+
+  vec3 rock = mix(vec3(0.070, 0.052, 0.046), vec3(0.150, 0.118, 0.100), d);
+  vec3 L = normalize(uLightDir);
+  vec3 lit = rock * (0.16 + 0.86 * max(dot(N, L), 0.0));
+
+  // 熔体脉络：压得越紧越亮，碎开之后随飞散冷却
+  float squeezed = smoothstep(0.0, 0.28, uShatter) * (1.0 - smoothstep(0.0, 0.42, vBurst));
+  lit += mix(vec3(0.85, 0.18, 0.03), vec3(1.0, 0.60, 0.20), vein)
+         * vein * (0.30 + 0.90 * squeezed) * 1.6;
+
+  // 内核的照明
+  float cd = length(vPos);
+  float cl = max(dot(N, -vPos / max(cd, 1e-4)), 0.0);
+  lit += vec3(1.0, 0.44, 0.14) * cl * uCoreGlow / (0.30 + cd * cd);
+
+  lit *= 1.0 - smoothstep(0.10, 0.85, vBurst) * 0.55;
+  gl_FragColor = vec4(lit, 1.0);
+}
+`;
+
+// 内核不碎，只被压实，所以不需要碎块属性，自己一套最省。
+const CORE_VERT = `
+uniform float uSquash;
+varying vec3 vSurf;
+varying vec3 vPos;
+void main(){
+  vSurf = normalize(position);
+  vec3 p = position * (1.0 - uSquash);
+  vPos = p;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+}
+`;
+
+const CORE_BODY_FRAG = `
+precision highp float;
+uniform float uHeat;
+varying vec3 vSurf;
+varying vec3 vPos;
+
+${NOISE}
+
+void main(){
+  vec3 n0 = normalize(vSurf);
+  float d = fbm3(n0 * 4.2) * 0.5 + 0.5;
+  // 边缘偏红：看过去光程更长、温度更低，中心才是白热
+  float rim = pow(1.0 - abs(dot(n0, normalize(cameraPosition - vPos))), 1.6);
+  vec3 hot = mix(vec3(1.00, 0.88, 0.66), vec3(1.00, 0.30, 0.05),
+                 clamp(0.28 + 0.44 * d + 0.46 * rim, 0.0, 1.0));
+  gl_FragColor = vec4(hot * uHeat, 1.0);   // >1 交给 bloom
+}
+`;
+
+/* ── 二向箔与内核辉光 ─────────────────────────────────── */
 
 const FOIL_VERT = `
 varying vec2 vUv;
@@ -539,6 +630,94 @@ void main(){
   gl_FragColor = vec4(col * a, a);
 }
 `;
+
+/* ── 后期：景深与颗粒 ─────────────────────────────────────
+   景深要深度，而 three 自带的 BokehPass 用 scene.overrideMaterial 自己渲一张，
+   那会绕开我们的顶点形变——碎片的深度会停留在未碎裂的球面上，最该虚化的
+   近处碎片反而全是实的。所以自己渲：逐对象换材质，形变共用同一套 uniform。
+
+   深度存的是到相机的径向距离（不是视空间 z），对景深来说这更贴近实际光学。 */
+
+// 深度的归一化上限。星空在 42~56，会被夹到 1.0，因此天然落在焦外。
+const DEPTH_FAR = 20.0;
+
+const DEPTH_FRAG = `
+precision highp float;
+uniform float uFar;
+varying vec3 vPos;
+void main(){
+  gl_FragColor = vec4(clamp(length(vPos - cameraPosition) / uFar, 0.0, 1.0), 0.0, 0.0, 1.0);
+}
+`;
+
+const DOF_SHADER = {
+  uniforms: {
+    tDiffuse:{ value:null }, tDepth:{ value:null },
+    uTexel:{ value:new THREE.Vector2() },
+    uFocus:{ value:0.2 }, uRange:{ value:0.125 }, uMax:{ value:5 }
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+  `,
+  fragmentShader: `
+    precision highp float;
+    uniform sampler2D tDiffuse;
+    uniform sampler2D tDepth;
+    uniform vec2 uTexel;
+    uniform float uFocus, uRange, uMax;
+    varying vec2 vUv;
+
+    void main(){
+      float z = texture2D(tDepth, vUv).r;
+      float coc = clamp(abs(z - uFocus) / uRange, 0.0, 1.0);
+      coc *= coc;                       // 焦内留宽一点，焦外掉得快
+      float r = coc * uMax;
+
+      // 画面绝大部分是合焦的，早退能省掉整屏的采样
+      if(r < 0.6){ gl_FragColor = vec4(texture2D(tDiffuse, vUv).rgb, 1.0); return; }
+
+      vec3 sum = vec3(0.0);
+      float wsum = 0.0;
+      for(int i = 0; i < 16; i++){
+        // Vogel 螺旋：黄金角铺点，接近泊松盘，而且不需要常量数组
+        // （GLSL ES 1.0 不支持带初始化的 const 数组）
+        float fi = float(i);
+        float a  = fi * 2.39996323;
+        float rr = sqrt((fi + 0.5) / 16.0) * r;
+        vec2 off = vec2(cos(a), sin(a)) * rr * uTexel;
+
+        float zs = texture2D(tDepth, vUv + off).r;
+        // 只让本身也在散焦的样点足额参与，否则清晰的前景会被糊到背景上
+        float w = abs(zs - uFocus) / uRange >= coc * 0.6 ? 1.0 : 0.25;
+        sum  += texture2D(tDiffuse, vUv + off).rgb * w;
+        wsum += w;
+      }
+      gl_FragColor = vec4(sum / max(wsum, 1e-4), 1.0);
+    }
+  `
+};
+
+// 颗粒挂在 OutputPass 之后：它是胶片/传感器的产物，该落在色调映射之后的显示空间里。
+const GRAIN_SHADER = {
+  uniforms: {
+    tDiffuse:{ value:null }, uTime:{ value:0 }, uAmount:{ value:0.060 }
+  },
+  vertexShader: DOF_SHADER.vertexShader,
+  fragmentShader: `
+    precision highp float;
+    uniform sampler2D tDiffuse;
+    uniform float uTime, uAmount;
+    varying vec2 vUv;
+    void main(){
+      vec3 c = texture2D(tDiffuse, vUv).rgb;
+      float n = fract(sin(dot(vUv * 1024.0 + uTime, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
+      // 中间调颗粒最重，纯黑和纯白处几乎没有——均匀加噪只会显脏
+      float lum = dot(c, vec3(0.299, 0.587, 0.114));
+      gl_FragColor = vec4(c + n * uAmount * (0.30 + 0.70 * (1.0 - abs(lum * 2.0 - 1.0))), 1.0);
+    }
+  `
+};
 
 /* ── 舞台 ────────────────────────────────────────────── */
 
@@ -654,6 +833,8 @@ export class PlanetStage {
     this._loadTextures();
     this._buildStars();
     this._buildPlanet();
+    this._buildMantle();
+    this._buildCoreBody();
     this._buildClouds();
     this._buildAtmo();
     this._buildFoil();
@@ -664,8 +845,15 @@ export class PlanetStage {
     // threshold 1.10 高于一切漫反射表面的峰值（冰约 1.03、云 0.90），
     // 因此只有自发光项参与溢出：岩浆 3.2 / 灯火 2.3 / 海面反射 1.9 / 箔片 / 内核。
     this.bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.90, 0.34, 1.10);
+
+    this._buildDepth();
+    this.dof = new ShaderPass(DOF_SHADER);
+    this.grain = new ShaderPass(GRAIN_SHADER);
+    // 顺序：景深在 bloom 之前（虚化的高光仍该溢出），颗粒在色调映射之后
+    this.composer.addPass(this.dof);
     this.composer.addPass(this.bloom);
     this.composer.addPass(new OutputPass());
+    this.composer.addPass(this.grain);
 
     this.resize();
   }
@@ -738,13 +926,52 @@ export class PlanetStage {
           gl_FragColor = vec4(vec3(0.85, 0.90, 1.0), a);
         }`
     });
-    this.scene.add(new THREE.Points(g, m));
+    this.stars = new THREE.Points(g, m);
+    this.scene.add(this.stars);
   }
 
-  /* — 行星。用 SphereGeometry 取其正确的等距柱状 UV；
-       转 non-indexed 以便给每个三角面挂碎裂属性。 — */
-  _buildPlanet(){
-    const geo = new THREE.SphereGeometry(1, 128, 80).toNonIndexed();
+  /* — 深度图。景深需要它，而它必须用和画面完全一致的顶点形变，
+       否则碎片的深度会停在未碎裂的球面上。uniform 直接共用同一批对象。 — */
+  _buildDepth(){
+    this.depthRT = new THREE.WebGLRenderTarget(1, 1, { depthBuffer:true });
+    const mk = (uni, vert, side) => new THREE.ShaderMaterial({
+      uniforms: Object.assign({ uFar:{ value:DEPTH_FAR } }, uni),
+      vertexShader: vert, fragmentShader: DEPTH_FRAG, side
+    });
+    this.depthMat = new Map([
+      [this.planet,   mk(this.uPlanet,   PLANET_VERT, THREE.DoubleSide)],
+      [this.mantle,   mk(this.uMantle,   PLANET_VERT, THREE.DoubleSide)],
+      [this.coreBody, mk(this.uCoreBody, CORE_VERT,   THREE.FrontSide)]
+    ]);
+    // 透明层不写深度：它们本来就不该决定景深的对焦面
+    this.depthHide = [this.clouds, this.atmo, this.foil, this.core, this.stars];
+  }
+
+  _renderDepth(){
+    const vis = this.depthHide.map(o => o.visible);
+    this.depthHide.forEach(o => { o.visible = false; });
+    const keep = [];
+    for(const [mesh, mat] of this.depthMat){
+      keep.push(mesh.material);
+      mesh.material = mat;
+    }
+
+    const prev = this.renderer.getRenderTarget();
+    this.renderer.setRenderTarget(this.depthRT);
+    this.renderer.setClearColor(0xffffff, 1);      // 空处 = 最远，星空因此会被虚化
+    this.renderer.clear();
+    this.renderer.render(this.scene, this.camera);
+    this.renderer.setRenderTarget(prev);
+    this.renderer.setClearColor(0x05070A, 1);
+
+    let i = 0;
+    for(const mesh of this.depthMat.keys()) mesh.material = keep[i++];
+    this.depthHide.forEach((o, k) => { o.visible = vis[k]; });
+  }
+
+  /* — 断裂图样：把三角面归成碎块，再把每块的刚体属性摊回它的每个顶点。
+       coarse 小于 1 表示裂得更大块——地幔比地壳韧，碎得也更粗。 — */
+  _fracture(geo, coarse){
     const pos = geo.attributes.position;
     const n = pos.count;
     const cen = new Float32Array(n * 3);
@@ -756,7 +983,6 @@ export class PlanetStage {
     // 一遍：把每个三角面归进碎块，顺便攒出各块的形心和面数
     const faces = n / 3;
     const keyOf = new Int32Array(faces);
-    const tri = new Float32Array(faces * 3);
     const blocks = new Map();
     for(let t = 0, f = 0; t < n; t += 3, f++){
       let cx = 0, cy = 0, cz = 0;
@@ -764,9 +990,10 @@ export class PlanetStage {
         cx += pos.getX(t + k); cy += pos.getY(t + k); cz += pos.getZ(t + k);
       }
       cx /= 3; cy /= 3; cz /= 3;
-      tri[f*3] = cx; tri[f*3+1] = cy; tri[f*3+2] = cz;
 
-      const key = fractureCell(cx, cy, cz);
+      // 归一化后再乘 coarse：不同半径的壳层才有可比的碎块尺度
+      const inv = coarse / (Math.hypot(cx, cy, cz) || 1);
+      const key = fractureCell(cx * inv, cy * inv, cz * inv);
       keyOf[f] = key;
       let b = blocks.get(key);
       if(!b){ b = { cx:0, cy:0, cz:0, c:0 }; blocks.set(key, b); }
@@ -808,6 +1035,13 @@ export class PlanetStage {
     geo.setAttribute('aAxis', new THREE.BufferAttribute(axis, 3));
     geo.setAttribute('aRnd', new THREE.BufferAttribute(rnd, 1));
     geo.setAttribute('aMass', new THREE.BufferAttribute(mass, 1));
+    return geo;
+  }
+
+  /* — 行星。用 SphereGeometry 取其正确的等距柱状 UV；
+       转 non-indexed 以便给每个三角面挂碎裂属性。 — */
+  _buildPlanet(){
+    const geo = this._fracture(new THREE.SphereGeometry(1, 128, 80).toNonIndexed(), 1.0);
 
     this.uPlanet = {
       uDay:{value:this.tex.day}, uNight:{value:this.tex.night},
@@ -815,13 +1049,47 @@ export class PlanetStage {
       uTempLag:{value:new THREE.Vector4(288, 288, 288, 288)},
       uPop:{value:1}, uSpinUV:{value:0}, uCover:{value:0.5},
       uLightDir:{value:this.lightDir},
-      uFoilX:{value:-1.9}, uShatter:{value:0}, uSpread:{value:1}
+      uFoilX:{value:-1.9}, uShatter:{value:0}, uSpread:{value:1},
+      uFracWin:{value:new THREE.Vector2(0.15, 0.09)}, uBurstK:{value:1.0},
+      uCoreGlow:{value:0}
     };
     this.planet = new THREE.Mesh(geo, new THREE.ShaderMaterial({
       uniforms:this.uPlanet, vertexShader:PLANET_VERT, fragmentShader:PLANET_FRAG,
       side:THREE.FrontSide
     }));
     this.scene.add(this.planet);
+  }
+
+  /* — 地幔：比地壳晚裂、碎得更大、飞得更慢。平时藏在不透明的地壳后面，
+       只在引力挤压时才打开——完整球体挡着它，白渲一层没有意义。 — */
+  _buildMantle(){
+    const geo = this._fracture(new THREE.SphereGeometry(0.86, 96, 56).toNonIndexed(), 0.58);
+    this.uMantle = {
+      uLightDir:{value:this.lightDir},
+      uFoilX:{value:-1.9}, uShatter:{value:0}, uSpread:{value:1},
+      uFracWin:{value:new THREE.Vector2(0.27, 0.11)}, uBurstK:{value:0.62},
+      uCoreGlow:{value:0}
+    };
+    this.mantle = new THREE.Mesh(geo, new THREE.ShaderMaterial({
+      uniforms:this.uMantle, vertexShader:PLANET_VERT, fragmentShader:MANTLE_FRAG,
+      side:THREE.FrontSide
+    }));
+    this.mantle.visible = false;
+    this.scene.add(this.mantle);
+  }
+
+  /* — 内核：不碎，只被压实、烧亮，最后作为余烬留在原地。
+       它还是碎片内侧的光源，「里面有东西」主要靠那道光。 — */
+  _buildCoreBody(){
+    this.uCoreBody = { uSquash:{value:0}, uHeat:{value:0.5} };
+    this.coreBody = new THREE.Mesh(
+      new THREE.IcosahedronGeometry(0.40, 4),
+      new THREE.ShaderMaterial({
+        uniforms:this.uCoreBody, vertexShader:CORE_VERT, fragmentShader:CORE_BODY_FRAG
+      })
+    );
+    this.coreBody.visible = false;
+    this.scene.add(this.coreBody);
   }
 
   _buildClouds(){
@@ -968,6 +1236,8 @@ export class PlanetStage {
     // 碎开之后才看得到断面。完整球体是闭合的，背面全被剔掉也无妨，
     // 始终开双面等于白付一倍的片元着色。
     this.planet.material.side = THREE.DoubleSide;
+    this.mantle.material.side = THREE.DoubleSide;
+    this.mantle.visible = this.coreBody.visible = true;
     return true;
   }
 
@@ -983,6 +1253,11 @@ export class PlanetStage {
     this.uCore.uOpacity.value = 0;
     this.core.visible = false;
     this.planet.material.side = THREE.FrontSide;
+    this.mantle.material.side = THREE.FrontSide;
+    this.mantle.visible = this.coreBody.visible = false;
+    this.uMantle.uShatter.value = 0;
+    this.uPlanet.uCoreGlow.value = this.uMantle.uCoreGlow.value = 0;
+    this.uCoreBody.uSquash.value = 0; this.uCoreBody.uHeat.value = 0.5;
     this.camAz = 0; this.camEl = 0; this.camPush = 0;
     this._applyCam();
   }
@@ -1031,7 +1306,7 @@ export class PlanetStage {
     else if(this.state === 'crush'){
       this.effectT += edt / 2.7;
       const t = Math.min(1, this.effectT);
-      for(const u of [this.uPlanet, this.uCloud]) u.uShatter.value = t;
+      for(const u of [this.uPlanet, this.uCloud, this.uMantle]) u.uShatter.value = t;
       this.uAtmo.uFade.value = 1 - this._ss(0.0, 0.26, t);
 
       if(t < 0.17){
@@ -1048,8 +1323,10 @@ export class PlanetStage {
       // 这也是这一击唯一的镜头语言：做完了，然后往后站。
       this.camPush = this._ss(0.16, 0.95, this.effectT) * 2.40;
 
-      // 内核必须等碎片开始分离才亮——提前亮就是在一颗完整球体前面糊一团白
-      const op = this._ss(0.17, 0.30, t) * (1 - this._ss(0.34, 0.72, t)) * 0.82;
+      this._updateInterior();
+
+      // 辉光晕必须等碎片开始分离才亮——提前亮就是在一颗完整球体前面糊一团白
+      const op = this._ss(0.17, 0.30, t) * (1 - this._ss(0.34, 0.72, t)) * 0.55;
       this.uCore.uOpacity.value = Math.max(0, op);
       this.core.visible = op > 0.002;
       const k = 0.42 + this._ss(0.15, 0.90, t) * 1.45;
@@ -1063,13 +1340,35 @@ export class PlanetStage {
       // 继续积分到 1.8：快的出画，慢的被残核引力拉回，剩下一团瓦砾。
       this.effectT += edt / 2.7;
       const v = Math.min(1.8, this.effectT);
-      this.uPlanet.uShatter.value = this.uCloud.uShatter.value = v;
+      this.uPlanet.uShatter.value = this.uCloud.uShatter.value = this.uMantle.uShatter.value = v;
       this.camPush = 2.40 + this._ss(1.0, 1.8, v) * 1.20;
+      this._updateInterior();
     }
 
     this._applyCam();
     this._shake(dt);          // 抖动走真实时间：停顿期间画面照样在震
+
+    this._renderDepth();
+    this.dof.uniforms.tDepth.value = this.depthRT.texture;
+    // 对焦面永远落在行星中心：镜头退开时焦点要跟着退，否则一退就全虚了
+    this.dof.uniforms.uFocus.value = (this.baseR + this.camPush) / DEPTH_FAR;
+    this.grain.uniforms.uTime.value = (this.grain.uniforms.uTime.value + dt * 61.0) % 1000.0;
+
     this.composer.render();
+  }
+
+  /* 内核与地幔的状态。挂在 effectT 上而不是夹到 1 的 t 上，
+     这样动画「结束」之后余烬还会继续冷下去。 */
+  _updateInterior(){
+    const e = this.effectT;
+    // 压实：塌缩期越压越紧，断裂之后就定在那儿了
+    this.uCoreBody.uSquash.value = Math.pow(Math.min(e, 0.30) / 0.30, 2.2) * 0.42;
+    // 亮度：塌缩点火 → 断裂时最亮 → 之后作为余烬慢慢冷
+    this.uCoreBody.uHeat.value = Math.max(
+      0.12, 0.35 + this._ss(0.05, 0.24, e) * 1.60 - this._ss(0.34, 1.5, e) * 1.45);
+    // 照亮碎片内侧的那道光，比内核本身收得快——碎片飞远后平方反比也会接管
+    const g = this._ss(0.10, 0.26, e) * 1.10 - this._ss(0.38, 1.25, e) * 1.00;
+    this.uPlanet.uCoreGlow.value = this.uMantle.uCoreGlow.value = Math.max(0, g);
   }
 
   // 命中停顿。先几乎冻住，再放回，返回缩放后的时间步。
@@ -1115,6 +1414,11 @@ export class PlanetStage {
     if(this.composer){
       this.composer.setPixelRatio(dpr);
       this.composer.setSize(w, h);
+      // 深度图与合成链同分辨率；模糊半径按像素给，所以要连 dpr 一起算
+      const pw = Math.round(w * dpr), ph = Math.round(h * dpr);
+      this.depthRT.setSize(pw, ph);
+      this.dof.uniforms.uTexel.value.set(1 / pw, 1 / ph);
+      this.dof.uniforms.uMax.value = Math.max(3, ph * 0.008);
     }
     this.camera.aspect = w / h;
     // 按视场角和宽高比反算距离。竖屏时限制维度是宽度，写死距离必然裁切；
