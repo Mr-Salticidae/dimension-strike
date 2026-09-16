@@ -93,25 +93,39 @@ vec3 flatten(vec3 p, out float outFlat){
 }
 
 // 压平 + 碎裂。只有行星本体走这条。
+//
+// 碎裂走「冲量 + 积分」，不是「位置 = f(进度)」。早先位移由 smoothstep 驱动，
+// 导数在两端归零——所有碎片同时起步、同时刹停，那是整个效果里最假的一处。
+// 断裂是瞬时冲量；此后真空中没有阻力，速度只被残核引力削减，于是慢的会落回、
+// 快的一去不返。这条长尾是免费的，只要别把位移直接插值。
 vec3 deform(vec3 p, vec3 cen, vec3 dir, vec3 axis, float rnd, out float outFlat){
   p = flatten(p, outFlat);
 
   if(uShatter > 0.0){
     float s = uShatter;
-    float implode = smoothstep(0.0, 0.16, s) * (1.0 - smoothstep(0.16, 0.30, s));
-    p *= 1.0 - implode * 0.24;
+    // rnd 已被飞散速度占用。再要一个独立随机量，否则「晚断裂的必定飞得慢」
+    float r2 = fract(rnd * 43758.5453);
 
-    float burst = smoothstep(0.20, 1.0, s);
-    if(burst > 0.0){
-      vec3 local = (p - cen) * (1.0 - burst * 0.40);
-      // 绕独立随机轴翻滚。若沿用飞散方向，碎片只会绕飞行轴自旋、
-      // 始终正对镜头，看起来是一地彩纸屑。
-      float ang = burst * (rnd * 2.0 - 1.0) * 16.0;
+    // 裂纹不会同时到达每一处：每片有自己的断裂时刻，断裂前随整体塌缩、
+    // 断裂后停止压缩。两者错开，塌缩末期的表面因此是碎的而不是光滑的。
+    float tFrac = 0.15 + r2 * 0.09;
+    float cs = min(s, tFrac);
+    float squeeze = pow(cs / 0.24, 2.4) * 0.26;   // 幂次：越塌缩引力越强
+    p   *= 1.0 - squeeze;
+    cen *= 1.0 - squeeze;
+
+    float tb = s - tFrac;
+    if(tb > 0.0){
+      vec3 local = p - cen;
+      // 绕独立随机轴匀速翻滚——真空里没有东西让它慢下来。若沿用飞散方向
+      // 作转轴，碎片只会绕飞行轴自旋、始终正对镜头，看起来是一地彩纸屑。
+      float ang = (rnd * 2.0 - 1.0) * 17.0 * tb;
       float c = cos(ang), si = sin(ang);
       local = local * c + cross(axis, local) * si + axis * dot(axis, local) * (1.0 - c);
-      // 速度离散：rnd 的三次方拉开长尾，少数碎片冲得远，多数留在近处
-      float speed = 0.35 + rnd * rnd * rnd * 4.6;
-      p = cen + local + dir * burst * speed;
+      // 初速离散：rnd 三次方拉长尾。二次项是残核引力，慢碎片会被拉回来。
+      float v0   = 0.42 + rnd * rnd * rnd * 3.4;
+      float disp = max(0.0, v0 * tb - 0.34 * tb * tb);
+      p = cen + local + dir * disp;
     }
   }
   return p;
@@ -152,7 +166,9 @@ uniform sampler2D uNight;    // NASA 夜间灯光
 uniform sampler2D uSpec;     // 水体遮罩（白 = 水）
 uniform sampler2D uCloudTex; // 用于地表云影
 
-uniform float uTemp;         // K
+// 四路温度，同一个目标值、四种跟随速度。滑块动的是注入的能量，
+// 各子系统按自己的热容响应：冰盖最慢，岩石最快。常数见 planet.js 的 ENV_TAU。
+uniform vec4  uTempLag;      // x=冰盖 y=植被 z=海洋 w=岩石，单位 K
 uniform float uPop;          // 0..1
 uniform float uSpinUV;       // 自转 = UV 横向偏移
 uniform float uShatter;
@@ -169,13 +185,12 @@ void main(){
   vec2 uv = vec2(vUv.x + uSpinUV, vUv.y);   // RepeatWrapping 负责环绕
   vec3 n0 = normalize(vSurf);
   float lat = abs(n0.y);
-  float T = uTemp;
 
   vec3  base  = texture2D(uDay, uv).rgb;
   float water = texture2D(uSpec, uv).r;
 
   // ── 冰盖：低温时从两极推进。水面结整片冰，陆地积雪。
-  float freeze  = smoothstep(296.0, 214.0, T);
+  float freeze  = smoothstep(296.0, 214.0, uTempLag.x);
   float iceLine = mix(1.16, -0.12, freeze);
   float ice     = smoothstep(iceLine - 0.13, iceLine + 0.02, lat) * freeze;
   // 冰的反照率保持在 bloom 阈值（1.10）之下，否则整颗雪球一起溢出成白板。
@@ -187,15 +202,15 @@ void main(){
 
   // ── 荒漠化：靠绿通道占优识别植被，升温后褪成沙色
   float veg  = clamp((base.g - (base.r + base.b) * 0.5) * 4.2, 0.0, 1.0);
-  float arid = smoothstep(292.0, 402.0, T);
+  float arid = smoothstep(292.0, 402.0, uTempLag.y);
   base = mix(base, vec3(0.560, 0.452, 0.298), arid * veg * (1.0 - water) * 0.92);
 
   // ── 海洋蒸干，露出海床
-  float boil = smoothstep(368.0, 452.0, T);
+  float boil = smoothstep(368.0, 452.0, uTempLag.z);
   base = mix(base, vec3(0.132, 0.114, 0.098), water * boil);
 
   // ── 熔融：程序化岩浆裂缝
-  float melt   = smoothstep(620.0, 900.0, T);
+  float melt   = smoothstep(620.0, 900.0, uTempLag.w);
   float ridge  = 1.0 - abs(fbm3(n0 * 3.1)) * 1.7;
   float cracks = pow(clamp(ridge, 0.0, 1.0), 6.0);
   vec3  magma  = mix(vec3(0.120,0.024,0.010), vec3(1.000,0.398,0.098), cracks);
@@ -444,6 +459,37 @@ const TEX = {
   spec:   './textures/earth_spec.jpg'
 };
 
+/* ── 环境响应的时间常数（秒） ──────────────────────────
+   滑块给的是目标值，各子系统按自己的热容去追它。数值按「你拖一秒、
+   他们过四十七年」的时标折算：冰盖 4 秒约合两百年。
+   这一层是「这是个天体」和「这是个控件」的分界——零延迟的跟手感，
+   比任何贴图问题都更快地暴露出它不是模拟。 */
+const ENV_TAU = {
+  ice:   4.0,   // 冰盖：热容最大，最后一个反应过来
+  sea:   2.6,   // 海洋：蒸干与封冻都慢
+  veg:   1.8,   // 植被：荒漠化要几代人
+  rock:  0.9,   // 岩石熔融：一旦够温度就很快
+  cloud: 0.75,  // 云量：成云消云以天计
+  air:   0.35   // 大气密度与配色：几乎即时
+};
+
+// 帧率无关的指数逼近。朴素的 lerp(x, 0.1) 在 144Hz 上会抖、30Hz 上会黏，
+// 因为它是「每帧走剩余距离的 10%」而不是「每秒衰减到 1/e」。
+const damp = (cur, tgt, tau, dt) => cur + (tgt - cur) * (1 - Math.exp(-dt / tau));
+
+/* 命中停顿：断裂那一帧把时间几乎冻住，再放回。2.7 秒的挤压里最关键的
+   就是那一下，匀速滑过去等于没发生。 */
+const STOP_HOLD = 0.13, STOP_RAMP = 0.24;
+
+/* 一维值噪声。镜头抖动的位移必须连续：逐帧随机数抖成的是高频噪点，
+   噪声场抖出来的才是晃动。 */
+const _hash1 = i => { const x = Math.sin(i * 127.1) * 43758.5453; return (x - Math.floor(x)) * 2 - 1; };
+function noise1(t){
+  const i = Math.floor(t), f = t - i;
+  const u = f * f * f * (f * (f * 6 - 15) + 10);
+  return _hash1(i) * (1 - u) + _hash1(i + 1) * u;
+}
+
 export class PlanetStage {
   constructor(canvas){
     this.canvas = canvas;
@@ -452,6 +498,18 @@ export class PlanetStage {
     this.effectT = 0;
     this.driftT = 0;
     this.onEffectEnd = null;
+    this.onShock = null;       // 断裂那一帧回调，供 HUD 同帧闪光
+
+    this.trauma = 0;           // 0..1，实际位移取其平方
+    this.shakeT = 0;
+    this.stop = 0;             // 命中停顿剩余时长，走真实时间
+    this.fractured = false;
+
+    // 环境：tgt 是滑块要求的，cur 是各子系统实际达到的
+    this.tgt = { temp:288, cover:0.5, ctint:0, density:0.85, tr:1, tg:1, tb:1 };
+    this.cur = { ice:288, sea:288, veg:288, rock:288,
+                 cover:0.5, ctint:0, density:0.85, tr:1, tg:1, tb:1 };
+    this.warm = false;         // 首帧直接落到目标，免得开场几秒在「回暖」
 
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:false });
     this.renderer.setClearColor(0x05070A, 1);
@@ -600,7 +658,8 @@ export class PlanetStage {
     this.uPlanet = {
       uDay:{value:this.tex.day}, uNight:{value:this.tex.night},
       uSpec:{value:this.tex.spec}, uCloudTex:{value:this.tex.clouds},
-      uTemp:{value:288}, uPop:{value:1}, uSpinUV:{value:0}, uCover:{value:0.5},
+      uTempLag:{value:new THREE.Vector4(288, 288, 288, 288)},
+      uPop:{value:1}, uSpinUV:{value:0}, uCover:{value:0.5},
       uLightDir:{value:this.lightDir},
       uFoilX:{value:-1.9}, uShatter:{value:0}, uSpread:{value:1}
     };
@@ -684,28 +743,53 @@ export class PlanetStage {
 
   /* ── 外部接口 ── */
 
+  // 只记录目标值。写进 uniform 的是 _dampEnv() 里按各自时间常数逼近的结果。
   setEnv(tempK, pressureAtm, popNorm){
-    this.uPlanet.uTemp.value = tempK;
     this.uPlanet.uPop.value = popNorm;
+    const t = this.tgt;
+    t.temp = tempK;
 
     // 云量：气压给上限，极端温度抑制（冻干 / 蒸散殆尽）
     const pc = Math.min(1, Math.pow(pressureAtm / 9, 0.60));
     const tk = Math.min(1, Math.max(0, (tempK - 150) / 120)) *
                Math.min(1, Math.max(0, (760 - tempK) / 180));
-    const cover = pc * (0.25 + 0.75 * tk);
-    this.uCloud.uCover.value = cover;
-    this.uPlanet.uCover.value = cover;
-    this.uCloud.uTint.value = Math.min(1, Math.max(0, (tempK - 340) / 260));
+    t.cover = pc * (0.25 + 0.75 * tk);
+    t.ctint = Math.min(1, Math.max(0, (tempK - 340) / 260));
 
-    this.uAtmo.uDensity.value = Math.min(2.2, Math.pow(pressureAtm / 1.2, 0.55) * 0.80);
+    t.density = Math.min(2.2, Math.pow(pressureAtm / 1.2, 0.55) * 0.80);
     // 高温大气偏橙（尘与硫），低温偏青白
     const hot = Math.min(1, Math.max(0, (tempK - 320) / 320));
     const cold = Math.min(1, Math.max(0, (250 - tempK) / 130));
-    this.uAtmo.uTint.value.setRGB(
-      1 + hot * 1.10 + cold * 0.15,
-      1 - hot * 0.22 + cold * 0.18,
-      1 - hot * 0.62 + cold * 0.10
-    );
+    t.tr = 1 + hot * 1.10 + cold * 0.15;
+    t.tg = 1 - hot * 0.22 + cold * 0.18;
+    t.tb = 1 - hot * 0.62 + cold * 0.10;
+  }
+
+  _dampEnv(dt){
+    const t = this.tgt, c = this.cur;
+    if(this.warm){
+      c.ice  = damp(c.ice,  t.temp, ENV_TAU.ice,  dt);
+      c.sea  = damp(c.sea,  t.temp, ENV_TAU.sea,  dt);
+      c.veg  = damp(c.veg,  t.temp, ENV_TAU.veg,  dt);
+      c.rock = damp(c.rock, t.temp, ENV_TAU.rock, dt);
+      c.cover   = damp(c.cover,   t.cover,   ENV_TAU.cloud, dt);
+      c.ctint   = damp(c.ctint,   t.ctint,   ENV_TAU.cloud, dt);
+      c.density = damp(c.density, t.density, ENV_TAU.air,   dt);
+      c.tr = damp(c.tr, t.tr, ENV_TAU.air, dt);
+      c.tg = damp(c.tg, t.tg, ENV_TAU.air, dt);
+      c.tb = damp(c.tb, t.tb, ENV_TAU.air, dt);
+    }else{
+      Object.assign(c, { ice:t.temp, sea:t.temp, veg:t.temp, rock:t.temp,
+                         cover:t.cover, ctint:t.ctint, density:t.density,
+                         tr:t.tr, tg:t.tg, tb:t.tb });
+      this.warm = true;
+    }
+
+    this.uPlanet.uTempLag.value.set(c.ice, c.veg, c.sea, c.rock);
+    this.uPlanet.uCover.value = this.uCloud.uCover.value = c.cover;
+    this.uCloud.uTint.value = c.ctint;
+    this.uAtmo.uDensity.value = c.density;
+    this.uAtmo.uTint.value.setRGB(c.tr, c.tg, c.tb);
   }
 
   triggerFoil(){
@@ -722,6 +806,7 @@ export class PlanetStage {
 
   reset(){
     this.state = 'idle'; this.effectT = 0;
+    this.trauma = 0; this.stop = 0; this.fractured = false;
     for(const u of [this.uPlanet, this.uCloud]){
       u.uFoilX.value = -1.9; u.uShatter.value = 0; u.uSpread.value = 1;
     }
@@ -735,28 +820,34 @@ export class PlanetStage {
   }
 
   update(dt){
-    this.spin += dt * 0.055;
+    const edt = this._timeScale(dt);   // 场景时间：命中停顿期间被压慢
+    this._dampEnv(edt);
+
+    this.spin += edt * 0.055;
     const spinUV = this.spin / (Math.PI * 2);
     this.uPlanet.uSpinUV.value = spinUV;
     this.uCloud.uSpinUV.value = spinUV * 1.18;   // 云走得比地表略快
 
     if(this.state === 'idle'){
       // 极慢的机位漂移。完全静止的机位是「粗糙」最容易被察觉的一处。
-      this.driftT += dt;
+      this.driftT += edt;
       this.camAz = Math.sin(this.driftT * 0.074) * 0.085;
       this.camEl = Math.sin(this.driftT * 0.053 + 1.7) * 0.062 + 0.045;
-      this._applyCam();
     }
     else if(this.state === 'foil'){
-      this.effectT += dt / 7.4;                     // 全程约 7.4 秒，缓慢不可抗
+      this.effectT += edt / 7.4;                    // 全程约 7.4 秒，缓慢不可抗
       const t = Math.min(1, this.effectT);
-      const e = t * t * (3 - 2 * t);
-      const x = -1.9 + e * 3.8;
+      // 箔片是被投下的，不是被插值的：全程只会越来越快。早先用 smoothstep，
+      // 末端速度归零，扫掠看起来像是自己停在了行星另一侧。
+      const x = -1.9 + t * (0.74 + 0.26 * t) * 3.8;
       for(const u of [this.uPlanet, this.uCloud]) u.uFoilX.value = x;
       // 大气随压平进程整体淡出：二维空间里没有大气层
       this.uAtmo.uFade.value = 1 - this._ss(0.0, 0.62, t);
       this.foil.position.x = x;
       this.uFoil.uOpacity.value = Math.sin(Math.min(1, t * 1.12) * Math.PI) * 0.78;
+
+      // 箔片压过行星期间的持续低鸣。它不是撞击，是那块空间在塌缩。
+      if(x > -1.05 && x < 1.05) this.trauma = Math.max(this.trauma, 0.30);
 
       // 相机抢在箔片抵达前转到掠射角。正面观察压平是看不出来的——
       // 厚度归零需要视差才能读出，这一转是整个效果成立的前提。
@@ -765,15 +856,28 @@ export class PlanetStage {
       this.camAz = ce * 0.30;
       this.camEl = ce * 0.36;
       this.camPush = ce * 1.25;
-      this._applyCam();
 
       if(t >= 1) this._finish();
     }
     else if(this.state === 'crush'){
-      this.effectT += dt / 2.7;
+      this.effectT += edt / 2.7;
       const t = Math.min(1, this.effectT);
       for(const u of [this.uPlanet, this.uCloud]) u.uShatter.value = t;
       this.uAtmo.uFade.value = 1 - this._ss(0.0, 0.26, t);
+
+      if(t < 0.17){
+        this.trauma = Math.max(this.trauma, 0.10 + t * 1.2);   // 塌缩期越压越响
+      }else if(!this.fractured){
+        // 断裂。停顿、震动、闪光必须落在同一帧上，否则三件事各说各的。
+        this.fractured = true;
+        this.stop = STOP_HOLD + STOP_RAMP;
+        this.trauma = 1;
+        if(this.onShock) this.onShock();
+      }
+
+      // 断裂后缓慢退开。碎片云比行星大得多，不退就只剩一屏纸屑；
+      // 这也是这一击唯一的镜头语言——做完了，然后往后站。
+      this.camPush = this._ss(0.17, 1.55, this.effectT) * 2.0;
 
       // 内核必须等碎片开始分离才亮——提前亮就是在一颗完整球体前面糊一团白
       const op = this._ss(0.17, 0.30, t) * (1 - this._ss(0.34, 0.72, t)) * 0.82;
@@ -785,8 +889,41 @@ export class PlanetStage {
 
       if(t >= 1) this._finish();
     }
+    else if(this.state === 'done' && this.uPlanet.uShatter.value > 0 && this.effectT < 1.8){
+      // 碎片不会在动画「结束」那一帧停住——真空里没有东西能让它们停下来。
+      // 继续积分到 1.8：快的出画，慢的被残核引力拉回，剩下一团瓦砾。
+      this.effectT += edt / 2.7;
+      const v = Math.min(1.8, this.effectT);
+      this.uPlanet.uShatter.value = this.uCloud.uShatter.value = v;
+      this.camPush = this._ss(0.17, 1.55, v) * 2.0;
+    }
 
+    this._applyCam();
+    this._shake(dt);          // 抖动走真实时间：停顿期间画面照样在震
     this.composer.render();
+  }
+
+  // 命中停顿。先几乎冻住，再放回，返回缩放后的时间步。
+  _timeScale(dt){
+    if(this.stop <= 0) return dt;
+    this.stop = Math.max(0, this.stop - dt);
+    const k = this.stop > STOP_RAMP ? 0.14
+                                    : 0.14 + 0.86 * (1 - this.stop / STOP_RAMP);
+    return dt * k;
+  }
+
+  // 镜头震动。trauma 线性衰减，位移取其平方——人对强度的感知是指数的，
+  // 平方让抖动起得猛、收得干净。抖旋转不抖平移：镜头是被震到，不是被推走，
+  // 构图也就不会跑掉。
+  _shake(dt){
+    this.trauma = Math.max(0, this.trauma - dt * 1.35);
+    if(this.trauma <= 0.001) return;
+    const a = this.trauma * this.trauma;
+    this.shakeT += dt;
+    const f = this.shakeT * 26;
+    this.camera.rotateX(noise1(f)        * a * 0.050);
+    this.camera.rotateY(noise1(f + 37.1) * a * 0.044);
+    this.camera.rotateZ(noise1(f + 91.7) * a * 0.062);
   }
 
   _ss(a, b, x){

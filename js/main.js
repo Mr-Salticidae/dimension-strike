@@ -79,17 +79,16 @@ function fire(kind){
   if(!ok) return;
   civ.strike(kind);
   el.crush.disabled = el.foil.disabled = true;
-  if(kind === 'crush') flashOnce(0.62);
 }
 
-function flashOnce(delay){
-  setTimeout(() => {
-    el.flash.animate(
-      [{ opacity:0 }, { opacity:.88, offset:.08 }, { opacity:0 }],
-      { duration:520, easing:'ease-out' }
-    );
-  }, delay * 1000);
-}
+// 闪光挂在断裂那一帧上，不能按秒数预定：命中停顿会把场景时间拉长，
+// 写死的延时必然和画面错开。
+stage.onShock = () => {
+  el.flash.animate(
+    [{ opacity:0 }, { opacity:.88, offset:.08 }, { opacity:0 }],
+    { duration:520, easing:'ease-out' }
+  );
+};
 
 stage.onEffectEnd = () => {
   el.verdictText.textContent = civ.verdict();
