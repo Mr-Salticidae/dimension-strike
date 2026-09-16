@@ -440,11 +440,13 @@ void main(){
 // 一个二维物体不该有可见的厚度梯度，所以这里不做柔和的辉光带：中线是一条
 // 极窄的硬线，两侧是它扰动光路留下的干涉彩边。早先那版是 pow 5 的对称白带，
 // 芯部直接顶到纯白 —— 读起来是一根光棒，不是一片零厚度的东西。
+// 面片长 5.2：前缘之后要留足已转换区域，尾部靠 pow 衰减掉，不必真的无限远。
+const FOIL_LEN = 5.2, FOIL_WID = 4.4;
+
 const FOIL_FRAG = `
 precision highp float;
 uniform float uOpacity;
 uniform float uTime;
-uniform float uCut;     // 箔片当前位置处行星截面的半径，0 = 已经切出去了
 varying vec2 vUv;
 
 // 薄膜干涉的廉价近似：相位决定被增强的波长。彩边是它唯一能被看见的方式。
@@ -453,26 +455,25 @@ vec3 spectrum(float t){
 }
 
 void main(){
-  float d = abs(vUv.x - 0.5) * 2.0;
-  float k = clamp(1.0 - d, 0.0, 1.0);
+  float u = vUv.x;                    // 1 = 前缘，向后衰减
 
-  float core   = pow(k, 46.0);                 // 中线：窄到几乎没有过渡
-  float phase  = d * 11.0 - uTime * 0.8;
-  float fringe = pow(k, 3.4) * (0.5 + 0.5 * cos(phase * 6.2831853)) * 0.34;
+  float edge   = pow(u, 52.0);        // 转换锋面：极窄
+  float tail   = pow(u, 3.2) * 0.16;  // 已经二维化的那片空间，留一层余辉
+  float phase  = (1.0 - u) * 24.0 - uTime * 0.8;
+  float fringe = pow(u, 7.0) * (0.5 + 0.5 * cos(phase * 6.2831853)) * 0.30;
 
-  // 只有正切进物质的那一段才亮。真空里它没有东西可作用，
-  // 一根贯穿整个画面、亮度还均匀的光棒，是「廉价」最直接的来源。
-  float hy    = abs(vUv.y - 0.5) * 5.6;        // 平面局部坐标即世界 Y
-  float cut   = smoothstep(uCut + 0.30, uCut - 0.02, hy);
-  float trace = 0.07 + 0.93 * cut;             // 截面外只留一丝痕迹
+  // 横向收在行星附近。二维化的是整个空间，但把它整块画亮就是一张发光板，
+  // 远处交给想象——同时这也是「一根贯穿画面的光棒」的解药。
+  float hz   = abs(vUv.y - 0.5) * ${FOIL_WID.toFixed(1)};
+  float span = smoothstep(2.05, 0.30, hz);
 
-  float fade = smoothstep(0.0, 0.10, vUv.y) * smoothstep(1.0, 0.90, vUv.y);
-  float a = (core + fringe) * fade * trace * uOpacity;
+  float a = (edge + tail + fringe) * span * uOpacity;
 
-  // 冷蓝，不给纯白：纯白 + 加性混合 = 一块曝掉的板子。
+  // 冷蓝，不给纯白：三通道一起过 1，ACES 一压就是一块曝掉的板子。
   // 颜色叙事里冷蓝属于观测者，这一击本来就是观测者的手笔。
-  vec3 col = vec3(0.30, 0.62, 1.15) * core * 2.2
-           + spectrum(phase * 0.5) * fringe * 1.4;
+  vec3 col = vec3(0.30, 0.62, 1.15) * edge * 4.0
+           + vec3(0.10, 0.34, 0.86) * tail * 2.2
+           + spectrum(phase * 0.5) * fringe * 1.6;
   gl_FragColor = vec4(col, a);
 }
 `;
@@ -746,9 +747,13 @@ export class PlanetStage {
     this.scene.add(this.atmo);
   }
 
+  /* — 二向箔就是行星要塌缩进去的那个平面本身，所以它是水平的。
+       早先它是一块竖直面片横着扫过去，压出来的却是一张水平的饼——刀面和切面
+       差 90°，那是再怎么调亮度也救不回来的。现在它躺在 y≈0 上，前缘沿 X 推进，
+       与压平后的薄片共面；未转换的那半边球会把前缘挡住，薄片从褶皱底下露出来。 — */
   _buildFoil(){
-    const geo = new THREE.PlaneGeometry(3.2, 5.6);
-    this.uFoil = { uOpacity:{value:0}, uTime:{value:0}, uCut:{value:0} };
+    const geo = new THREE.PlaneGeometry(FOIL_LEN, FOIL_WID);
+    this.uFoil = { uOpacity:{value:0}, uTime:{value:0} };
     // depthTest 必须开。关掉它箔片就画在所有东西之上，永远不会被行星挡住——
     // 那是「贴在画面上的一道光」和「场景里的一个东西」之间最直接的区别。
     this.foil = new THREE.Mesh(geo, new THREE.ShaderMaterial({
@@ -756,11 +761,15 @@ export class PlanetStage {
       transparent:true, depthWrite:false, depthTest:true,
       blending:THREE.AdditiveBlending, side:THREE.DoubleSide
     }));
-    this.foil.rotation.y = Math.PI / 2;   // YZ 平面，沿 X 扫掠
-    this.foil.position.x = -1.9;
+    this.foil.rotation.x = -Math.PI / 2;   // 躺平，法线沿 +Y
+    this.foil.position.y = 0.06;           // 略高于薄片，免得共面打架
+    this._placeFoil(-1.9);
     this.foil.renderOrder = 10;
     this.scene.add(this.foil);
   }
+
+  // 前缘落在 x 处：面片中心要往后退半个身位
+  _placeFoil(x){ this.foil.position.x = x - FOIL_LEN / 2; }
 
   _buildCore(){
     this.uCore = { uOpacity:{value:0} };
@@ -856,7 +865,7 @@ export class PlanetStage {
     }
     this.uAtmo.uFade.value = 1;
     this.uFoil.uOpacity.value = 0;
-    this.foil.position.x = -1.9;
+    this._placeFoil(-1.9);
     this.uCore.uOpacity.value = 0;
     this.core.visible = false;
     this.camAz = 0; this.camEl = 0; this.camPush = 0;
@@ -887,10 +896,8 @@ export class PlanetStage {
       for(const u of [this.uPlanet, this.uCloud]) u.uFoilX.value = x;
       // 大气随压平进程整体淡出：二维空间里没有大气层
       this.uAtmo.uFade.value = 1 - this._ss(0.0, 0.62, t);
-      this.foil.position.x = x;
+      this._placeFoil(x);
       this.uFoil.uTime.value = this.effectT;
-      // 箔片在这个位置切到的截面半径。切出行星之后它就没东西可作用了。
-      this.uFoil.uCut.value = Math.sqrt(Math.max(0, 1 - x * x));
       this.uFoil.uOpacity.value = Math.sin(Math.min(1, t * 1.12) * Math.PI) * 0.78;
 
       // 箔片压过行星期间的持续低鸣。它不是撞击，是那块空间在塌缩。
