@@ -1,0 +1,254 @@
+/* 降维打击模拟器 — 高维观测者控制台
+   色彩叙事：琥珀 = 他们（文明信号）  冷蓝 = 你（观测者）
+   文明消亡时 --amber-live 由 JS 向 --dead 收敛，琥珀从界面抽干。 */
+
+:root{
+  --void:#05070A;
+  --void-2:#080C11;
+  --panel:rgba(10,15,21,.72);
+  --line:rgba(120,150,175,.20);
+  --line-2:rgba(120,150,175,.38);
+  --ink:#D5DEE6;
+  --ink-2:#8C9BA8;
+  --ink-3:#5A6773;
+  --cold:#6FA8D6;
+  --cold-dim:#3E6B90;
+  --amber:#E8B04B;
+  --dead:#5A6773;
+  --amber-live:#E8B04B;
+  --alert:#D9553F;
+  --mono:ui-monospace,"SF Mono","Cascadia Mono","Consolas","Liberation Mono",monospace;
+  --cjk:"PingFang SC","Microsoft YaHei","Hiragino Sans GB","Noto Sans CJK SC",sans-serif;
+  --pad:clamp(14px,2.2vw,22px);
+}
+
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--void); color:var(--ink);
+  font-family:var(--cjk); font-size:14px; line-height:1.55;
+  overflow:hidden; -webkit-font-smoothing:antialiased;
+}
+#stage{position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none}
+
+#vignette{
+  position:fixed; inset:0; pointer-events:none; z-index:1;
+  background:radial-gradient(ellipse 120% 90% at 50% 50%, transparent 30%, rgba(0,0,0,.55) 100%);
+}
+
+/* ── 标题 ───────────────────────────────── */
+.brand{
+  position:fixed; z-index:3; top:0; left:0;
+  padding:calc(var(--pad) + env(safe-area-inset-top,0px)) var(--pad) var(--pad);
+}
+.brand-mark{
+  font-size:clamp(17px,2.3vw,21px); font-weight:600; letter-spacing:.14em;
+  color:var(--ink); text-shadow:0 0 30px rgba(111,168,214,.35);
+}
+.brand-sub{
+  margin-top:5px; font-family:var(--mono); font-size:10px;
+  letter-spacing:.2em; color:var(--ink-3);
+}
+.brand-credit{
+  margin-top:7px; font-family:var(--mono); font-size:9px;
+  letter-spacing:.06em; color:var(--ink-3); opacity:.72;
+}
+.brand-credit a{color:inherit; text-decoration:underline; text-underline-offset:2px}
+.brand-credit a:hover{color:var(--cold)}
+
+/* ── 面板通用 ───────────────────────────── */
+.panel{
+  position:fixed; z-index:3; width:clamp(232px,21vw,278px);
+  background:var(--panel); backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+  border:1px solid var(--line); padding:16px;
+  display:flex; flex-direction:column; gap:15px;
+}
+.panel::before,.panel::after{
+  content:""; position:absolute; width:7px; height:7px; border:1px solid var(--line-2);
+}
+.panel::before{top:-1px; left:-1px; border-right:0; border-bottom:0}
+.panel::after{bottom:-1px; right:-1px; border-left:0; border-top:0}
+.panel-left{left:var(--pad); top:50%; transform:translateY(-50%)}
+.panel-right{right:var(--pad); top:50%; transform:translateY(-50%)}
+
+.panel-title{
+  margin:0; font-size:11px; font-weight:600; letter-spacing:.22em; color:var(--ink-2);
+  display:flex; justify-content:space-between; align-items:center;
+  padding-bottom:9px; border-bottom:1px solid var(--line);
+}
+.panel-tag{font-family:var(--mono); font-size:9px; letter-spacing:.12em; color:var(--cold-dim)}
+.panel-tag.is-alert{color:var(--alert)}
+
+/* ── 滑块 ───────────────────────────────── */
+.ctl{display:grid; grid-template-columns:1fr auto; gap:7px 8px}
+.ctl label{font-size:12px; color:var(--ink-2); letter-spacing:.06em}
+.ctl-val{font-family:var(--mono); font-size:15px; color:var(--cold); font-variant-numeric:tabular-nums}
+.ctl-val i{font-style:normal; font-size:9px; color:var(--ink-3); margin-left:3px}
+.ctl input[type=range]{grid-column:1/-1; -webkit-appearance:none; appearance:none; width:100%; height:16px; background:transparent; cursor:ew-resize; margin:0}
+.ctl input[type=range]::-webkit-slider-runnable-track{height:2px; background:var(--line-2)}
+.ctl input[type=range]::-moz-range-track{height:2px; background:var(--line-2)}
+.ctl input[type=range]::-webkit-slider-thumb{
+  -webkit-appearance:none; width:3px; height:15px; background:var(--cold); margin-top:-6.5px;
+  box-shadow:0 0 11px rgba(111,168,214,.85);
+}
+.ctl input[type=range]::-moz-range-thumb{width:3px; height:15px; border:0; border-radius:0; background:var(--cold); box-shadow:0 0 11px rgba(111,168,214,.85)}
+.ctl input[type=range]:focus-visible{outline:1px solid var(--cold); outline-offset:4px}
+.ctl-scale{
+  grid-column:1/-1; display:flex; justify-content:space-between;
+  font-family:var(--mono); font-size:9px; color:var(--ink-3); margin-top:-3px;
+}
+.ctl-ideal{color:var(--amber-live)}
+
+/* ── 目标读数 ───────────────────────────── */
+.target-id{font-size:14px; letter-spacing:.06em}
+.target-id .num{font-family:var(--mono); color:var(--amber-live)}
+.target-sub{margin-top:3px; font-family:var(--mono); font-size:9px; letter-spacing:.06em; color:var(--ink-3)}
+
+.readout{margin:0; display:flex; flex-direction:column; gap:7px}
+.readout>div{display:flex; justify-content:space-between; align-items:baseline; gap:10px}
+.readout dt{font-size:11px; color:var(--ink-3); letter-spacing:.08em}
+.readout dd{margin:0; font-family:var(--mono); font-size:13px; color:var(--ink); font-variant-numeric:tabular-nums}
+
+.bar{height:2px; background:var(--line-2); overflow:hidden}
+.bar-fill{height:100%; width:100%; background:var(--amber-live); transition:width .3s ease, background .5s ease}
+
+.log-title{
+  margin:2px 0 0; font-size:10px; font-weight:600; letter-spacing:.2em; color:var(--ink-2);
+  display:flex; justify-content:space-between; align-items:center;
+  padding-bottom:7px; border-bottom:1px solid var(--line);
+}
+.log-src{font-family:var(--mono); font-size:9px; color:var(--ink-3); letter-spacing:.08em}
+.log{
+  list-style:none; margin:0; padding:0; display:flex; flex-direction:column-reverse; gap:8px;
+  max-height:min(28vh,190px); overflow-y:auto; scrollbar-width:thin;
+}
+.log li{
+  font-size:11.5px; line-height:1.5; color:var(--ink-2);
+  padding-left:9px; border-left:1px solid var(--line-2);
+  animation:logIn .45s ease both;
+}
+.log li.is-new{color:var(--amber-live); border-left-color:var(--amber-live)}
+.log li.is-final{color:var(--alert); border-left-color:var(--alert)}
+.log li time{display:block; font-family:var(--mono); font-size:8.5px; color:var(--ink-3); letter-spacing:.08em; margin-bottom:2px}
+@keyframes logIn{from{opacity:0; transform:translateX(-6px)}to{opacity:1; transform:none}}
+
+/* ── 打击按钮 ───────────────────────────── */
+.strike{
+  position:fixed; z-index:3; left:50%; transform:translateX(-50%);
+  bottom:calc(var(--pad) + env(safe-area-inset-bottom,0px));
+}
+.strike-row{display:flex; gap:10px}
+.btn{
+  font-family:inherit; color:var(--ink); background:var(--panel);
+  backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+  border:1px solid var(--line-2); cursor:pointer;
+  transition:border-color .2s, background .2s, color .2s, opacity .2s;
+}
+.btn:focus-visible{outline:1px solid var(--cold); outline-offset:3px}
+.btn-strike{display:flex; align-items:center; gap:11px; padding:11px 17px 11px 13px; text-align:left}
+.btn-strike:hover:not(:disabled){border-color:var(--alert); background:rgba(217,85,63,.10)}
+.btn-strike:disabled{opacity:.3; cursor:not-allowed}
+.btn-txt{display:flex; flex-direction:column; line-height:1.3}
+.btn-txt b{font-size:13px; font-weight:600; letter-spacing:.08em}
+.btn-txt i{font-style:normal; font-family:var(--mono); font-size:9px; color:var(--ink-3); letter-spacing:.1em; margin-top:2px}
+.btn-ico{width:20px; height:20px; flex:none; border:1px solid var(--line-2); position:relative}
+.btn-ico[data-ico=fist]::after{content:""; position:absolute; inset:5px; background:var(--ink-2)}
+.btn-ico[data-ico=palm]::after{content:""; position:absolute; left:3px; right:3px; top:9px; height:1px; background:var(--ink-2); box-shadow:0 0 8px var(--cold)}
+.btn-foil:hover:not(:disabled){border-color:var(--cold); background:rgba(111,168,214,.10)}
+.btn-ghost{padding:8px 12px; font-size:11px; letter-spacing:.12em; color:var(--ink-2); background:transparent}
+.btn-ghost:hover{border-color:var(--cold); color:var(--ink)}
+.btn-sm{width:100%; padding:6px 10px; font-size:10px}
+
+/* ── 摄像头 ─────────────────────────────── */
+.cam{
+  position:fixed; z-index:3; right:var(--pad);
+  bottom:calc(var(--pad) + env(safe-area-inset-bottom,0px));
+  width:172px; background:var(--panel); backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+  border:1px solid var(--line); padding:10px; display:flex; flex-direction:column; gap:8px;
+}
+.cam-head{display:flex; justify-content:space-between; align-items:center}
+.cam-title{font-size:10px; letter-spacing:.16em; color:var(--ink-2)}
+.cam-state{font-family:var(--mono); font-size:9px; letter-spacing:.06em; color:var(--ink-3)}
+.cam-state.is-live{color:var(--amber-live)}
+.cam-state.is-err{color:var(--alert)}
+.cam-body{position:relative; aspect-ratio:4/3; width:100%; max-width:100%; background:var(--void-2); border:1px solid var(--line); overflow:hidden}
+.cam-body video,.cam-body canvas{position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1)}
+.cam-body video{opacity:.5}
+.cam-hint{
+  position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center;
+  font-size:9.5px; line-height:1.7; color:var(--ink-3); padding:8px;
+}
+.cam.is-live .cam-hint{display:none}
+
+/* ── 全屏效果 ───────────────────────────── */
+.flash{position:fixed; inset:0; z-index:4; pointer-events:none; background:#fff; opacity:0}
+.verdict{
+  position:fixed; z-index:5; inset:0; pointer-events:none;
+  display:flex; align-items:center; justify-content:center;
+  padding:var(--pad); opacity:0; transition:opacity 1.6s ease;
+  /* 压暗中心，保证判词压在任何亮部上都读得清 */
+  background:radial-gradient(ellipse 58% 34% at 50% 50%, rgba(3,5,8,.90) 18%, rgba(3,5,8,.55) 55%, transparent 78%);
+}
+.verdict.is-on{opacity:1}
+.verdict p{
+  margin:0; max-width:30ch; text-align:center; font-size:clamp(15px,2.3vw,20px);
+  line-height:2.1; letter-spacing:.1em; color:var(--ink);
+  white-space:pre-line;               /* 判词里的换行是设计的一部分 */
+  text-shadow:0 2px 24px rgba(0,0,0,.95);
+}
+
+@media (prefers-reduced-motion:reduce){
+  *{animation-duration:.01ms!important; transition-duration:.01ms!important}
+}
+
+/* ── 窄屏 ───────────────────────
+   手机上两块面板加按钮会吃光整屏，行星——整个作品的主体——只剩一条缝。
+   所以压缩面板：读数改横排、通讯记录只留最新一条、隐藏次要说明，
+   把屏幕中段整段让给行星。 */
+@media (max-width:900px){
+  :root{--pad:12px}
+  .cam{display:none}
+
+  .brand{padding-bottom:8px}
+  .brand-mark{font-size:16px; letter-spacing:.1em}
+  .brand-sub{font-size:8.5px; margin-top:3px}
+  .brand-credit{font-size:8px; margin-top:4px}
+
+  .panel{position:fixed; width:auto; transform:none; padding:10px 12px; gap:9px}
+  .panel-title{padding-bottom:7px; font-size:10px}
+
+  /* 监测面板贴顶，读数横排 */
+  .panel-right{
+    left:var(--pad); right:var(--pad); bottom:auto;
+    top:calc(52px + env(safe-area-inset-top,0px));
+  }
+  .target-sub{display:none}
+  .target-id{font-size:12.5px}
+  .readout{flex-direction:row; justify-content:space-between; gap:12px}
+  .readout>div{flex-direction:column; align-items:flex-start; gap:1px}
+  .readout dt{font-size:9.5px}
+  .readout dd{font-size:14px}
+  .log-title{font-size:9px; padding-bottom:5px}
+  .log{max-height:none; height:2.9em; overflow:hidden}   /* 只露最新一条 */
+  .log li{font-size:10.5px; line-height:1.4}
+  .log li time{display:none}
+
+  /* 控制面板贴底，压在打击按钮之上 */
+  .panel-left{
+    left:var(--pad); right:var(--pad); top:auto;
+    bottom:calc(58px + var(--pad) + env(safe-area-inset-bottom,0px));
+  }
+  .ctl{gap:4px 8px}
+  .ctl label{font-size:11px}
+  .ctl-val{font-size:13px}
+  .ctl-scale{font-size:8.5px}
+  .btn-ghost{padding:6px 10px; font-size:10px}
+
+  /* 打击按钮定死在最底一行，文字不许折行 */
+  .strike{bottom:calc(var(--pad) + env(safe-area-inset-bottom,0px)); left:var(--pad); right:var(--pad); transform:none}
+  .strike-row{justify-content:center; gap:8px}
+  .btn-strike{flex:1 1 0; min-width:0; padding:8px 10px; gap:8px; justify-content:center}
+  .btn-txt b{font-size:12px; white-space:nowrap}
+  .btn-txt i{font-size:8.5px; white-space:nowrap}
+  .btn-ico{width:17px; height:17px}
+}

@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>降维打击模拟器</title>
+<link rel="stylesheet" href="./css/style.css">
+</head>
+<body>
+
+<canvas id="stage"></canvas>
+<div id="vignette"></div>
+
+<header class="brand">
+  <div class="brand-mark">降维打击模拟器</div>
+  <div class="brand-sub">DIMENSIONAL&nbsp;STRIKE&nbsp;·&nbsp;高维观测者控制台</div>
+  <div class="brand-credit">地表影像 <a href="https://www.solarsystemscope.com/textures/" target="_blank" rel="noopener">Solar System Scope</a> · CC&nbsp;BY&nbsp;4.0</div>
+</header>
+
+<section class="panel panel-left" aria-label="环境参数">
+  <h2 class="panel-title">环境参数<span class="panel-tag">ENV</span></h2>
+
+  <div class="ctl">
+    <label for="temp">表面均温</label>
+    <output id="tempOut" class="ctl-val">288<i>K</i></output>
+    <input id="temp" type="range" min="90" max="900" step="1" value="288">
+    <div class="ctl-scale"><span>90</span><span class="ctl-ideal">288 宜居</span><span>900</span></div>
+  </div>
+
+  <div class="ctl">
+    <label for="pres">大气压强</label>
+    <output id="presOut" class="ctl-val">1.00<i>atm</i></output>
+    <input id="pres" type="range" min="0" max="100" step="0.5" value="50">
+    <div class="ctl-scale"><span>0.01</span><span class="ctl-ideal">1.0 宜居</span><span>100</span></div>
+  </div>
+
+  <button id="reset" class="btn btn-ghost" type="button">恢复初始参数</button>
+</section>
+
+<section class="panel panel-right" aria-label="目标监测">
+  <h2 class="panel-title">目标监测<span class="panel-tag" id="statusTag">OBSERVING</span></h2>
+
+  <div class="target">
+    <div class="target-id">第 <span class="num">3,241</span> 号文明</div>
+    <div class="target-sub">GLIESE&nbsp;581&nbsp;/&nbsp;IV&nbsp;· 碳基 · 已进入行星际时代</div>
+  </div>
+
+  <dl class="readout">
+    <div><dt>人口</dt><dd id="popOut" class="num">78.4 亿</dd></div>
+    <div><dt>技术等级</dt><dd id="techOut" class="num">2.41</dd></div>
+    <div><dt>宜居指数</dt><dd id="habOut" class="num">1.00</dd></div>
+  </dl>
+
+  <div class="bar" role="img" aria-label="宜居指数"><div id="habBar" class="bar-fill"></div></div>
+
+  <h3 class="log-title">通讯记录<span class="log-src">1420 MHz</span></h3>
+  <ul id="log" class="log"></ul>
+</section>
+
+<section class="strike" aria-label="打击选项">
+  <div class="strike-row">
+    <button id="crush" class="btn btn-strike" type="button">
+      <span class="btn-ico" data-ico="fist"></span>
+      <span class="btn-txt"><b>引力挤压</b><i>握拳</i></span>
+    </button>
+    <button id="foil" class="btn btn-strike btn-foil" type="button">
+      <span class="btn-ico" data-ico="palm"></span>
+      <span class="btn-txt"><b>二向箔投放</b><i>摊开手掌</i></span>
+    </button>
+  </div>
+</section>
+
+<section class="cam" id="cam" aria-label="手势输入">
+  <div class="cam-head">
+    <span class="cam-title">手势输入</span>
+    <span id="gestState" class="cam-state">未启用</span>
+  </div>
+  <div class="cam-body">
+    <video id="video" playsinline muted></video>
+    <canvas id="hand"></canvas>
+    <div id="camHint" class="cam-hint">开启摄像头后<br>握拳或摊开手掌即可发动</div>
+  </div>
+  <button id="camBtn" class="btn btn-ghost btn-sm" type="button">开启摄像头</button>
+</section>
+
+<div id="flash" class="flash" aria-hidden="true"></div>
+<div id="verdict" class="verdict" aria-hidden="true"><p id="verdictText"></p></div>
+
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.js" } }
+</script>
+<script type="module" src="./js/main.js"></script>
+</body>
+</html>
