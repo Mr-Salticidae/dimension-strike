@@ -72,6 +72,32 @@ float fbm3(vec3 p){
 }
 `;
 
+/* ── 大气环流 ────────────────────────────────────────────
+   云不是一整块贴图在平移。真实的云层被纬向风带撕开：信风带（0~30°）吹东风，
+   云向西走；西风带（30~60°）反向，云向东走；极地东风（60~90°）又转向西，
+   且弱而不稳。相邻两带方向相反，交界处因此持续剪切——那才叫云层在动，
+   而不是在挪。
+
+   云量也分带：赤道辐合带（ITCZ，实际中心约在 6°N 而不是赤道上）是最厚的一条；
+   副热带约 25° 是哈德里环流的下沉支，最薄；中纬约 46° 的风暴轴又回升。 */
+const WIND = `
+float zonalWind(float s){          // s = sin(纬度)，带符号
+  float a = abs(s);
+  float trade = -0.60 * (1.0 - smoothstep(0.26, 0.56, a));
+  float west  =  1.00 * smoothstep(0.32, 0.60, a) * (1.0 - smoothstep(0.76, 0.94, a));
+  float polar = -0.32 * smoothstep(0.80, 0.97, a);
+  return trade + west + polar;
+}
+
+float cloudBand(float s){
+  float a = abs(s);
+  float itcz  =  1.00 * (1.0 - smoothstep(0.02, 0.26, abs(s - 0.10)));
+  float dry   = -0.62 * (1.0 - smoothstep(0.00, 0.24, abs(a - 0.42)));
+  float storm =  0.42 * (1.0 - smoothstep(0.00, 0.32, abs(a - 0.72)));
+  return itcz + dry + storm;
+}
+`;
+
 /* ── 顶点形变（二向箔压平 + 引力挤压） ────────────────── */
 
 const DEFORM = `
@@ -195,6 +221,10 @@ uniform float uPop;          // 0..1
 uniform float uSpinUV;       // 自转 = UV 横向偏移
 uniform float uShatter;
 uniform float uCover;        // 云量
+uniform float uWind;         // 纬向风累计位移，与云层共用
+uniform float uCrustT;       // 岩石圈温度：比冰盖更慢的一条通道
+uniform float uFire;         // 当前火灾强度（由热冲击驱动）
+uniform float uBurn;         // 累计过火面积
 uniform float uCoreGlow;     // 内核亮度，用于照亮碎片内侧
 uniform vec3  uLightDir;
 
@@ -206,6 +236,19 @@ varying float vFlat;
 varying float vBurst;
 
 ${NOISE}
+${WIND}
+
+/* 冰量。抽成函数是为了能用第二条更慢的温度通道再算一遍：两者之差就是
+   「冰刚刚退走的地方」。冰缘不是一条纬线——噪声打碎边界；海面先冻（薄冰
+   铺得快，陆地冰盖要靠积雪一层层堆，故对水体额外下压）；干而亮的高地与
+   荒漠辐射降温最快，也先白。 */
+float iceAmount(float T, float lat, float water, float alt, float nLow, float nMid){
+  float freeze = smoothstep(296.0, 214.0, T);
+  float line = mix(1.16, -0.12, freeze)
+             + (nLow - 0.5) * 0.17 + (nMid - 0.5) * 0.06
+             - water * 0.13 - alt * 0.10;
+  return smoothstep(line - 0.10, line + 0.05, lat) * freeze;
+}
 
 void main(){
   vec2 uv = vec2(vUv.x + uSpinUV, vUv.y);   // RepeatWrapping 负责环绕
@@ -227,14 +270,8 @@ void main(){
   float nMid = fbm3(n0 * 6.1) * 0.5 + 0.5;
 
   // ── 冰盖：低温时从两极推进
-  float freeze = smoothstep(296.0, 214.0, uTempLag.x);
-  // 冰缘不是一条纬线。三件事把它拉开：噪声打碎边界；海面先冻（薄冰铺得快，
-  // 陆地冰盖要靠积雪一层层堆）；干而亮的高地与荒漠辐射降温最快，也先白。
-  float alt     = clamp((relief - 0.44) * 2.2, 0.0, 1.0) * (1.0 - water);
-  float iceLine = mix(1.16, -0.12, freeze)
-                + (nLow - 0.5) * 0.17 + (nMid - 0.5) * 0.06
-                - water * 0.13 - alt * 0.10;
-  float ice     = smoothstep(iceLine - 0.10, iceLine + 0.05, lat) * freeze;
+  float alt = clamp((relief - 0.44) * 2.2, 0.0, 1.0) * (1.0 - water);
+  float ice = iceAmount(uTempLag.x, lat, water, alt, nLow, nMid);
   // 海冰的边缘是碎的。只在过渡带里掺高频噪声——(1-|2i-1|) 在 i=0.5 处最大、
   // 两端归零，所以冰盖内部和开阔水面都不受影响，碎的只有交界那一圈浮冰。
   // 陆地不参与：积雪的边界本来就比海冰整齐。
@@ -258,6 +295,30 @@ void main(){
   vec3 sand = mix(vec3(0.470, 0.392, 0.286), vec3(0.624, 0.498, 0.322), nMid);
   base = mix(base, sand, arid * veg * (1.0 - water) * 0.92);
 
+  // ── 火灾：热冲击打在还没来得及适应的植被上
+  // 强度由 uFire 给（目标温度与植被通道的落差 × 可燃温区），慢慢拧滑块不会着火，
+  // 猛地拉上去才会——烧起来的是「跟不上」的那部分生物圈。
+  float land = (1.0 - water) * (1.0 - ice);
+  vec3  fq   = n0 * 7.4 + vec3(0.0, uWind * 3.2, 0.0);
+  // 火头是锋面不是散点。取噪声的零交叉（脊线）才得到连续的火线；
+  // 直接对噪声取高次幂只会得到稀疏的孤立亮点，暗到看不见。
+  float fr    = 1.0 - abs(fbm3(fq)) * 2.6;
+  float front = pow(clamp(fr, 0.0, 1.0), 4.0);
+  float fire  = uFire * veg * land * front;
+
+  // 过火痕迹：焦黑的斑块，随累计过火面积扩张，植被恢复后再慢慢褪去。
+  // 复用低频噪声场——烧过的疤本来就是大片的。
+  float scar = smoothstep(1.02 - uBurn * 1.18, 1.04 - uBurn * 1.18, nLow) * veg * land;
+  base = mix(base, vec3(0.074, 0.060, 0.050), scar * 0.92);
+
+  // 烟往下风方向拖：取上风处的火强度，就得到「这里的烟是那边烧出来的」。
+  // east 是当地的向东切向；zonalWind 为负（信风带）时上风在东侧，符号自动反过来。
+  vec3  east   = normalize(vec3(-n0.z, 0.0, n0.x) + vec3(1e-5));
+  vec3  upwind = fq - east * (zonalWind(n0.y) * 1.15);
+  float sr     = 1.0 - abs(fbm3(upwind)) * 2.6;
+  float smoke  = pow(clamp(sr, 0.0, 1.0), 2.2) * uFire * land;
+  base = mix(base, vec3(0.300, 0.266, 0.232), clamp(smoke * 1.15, 0.0, 0.78));
+
   // ── 海洋蒸干：先退浅海，再退深海
   // 近岸判定靠对水体遮罩做四点采样，邻域里出现陆地就是浅水。均匀地把整片海
   // 压暗，读起来是海水在褪色；先露大陆架再露海盆，才是海在退去。
@@ -279,7 +340,8 @@ void main(){
 
   // ── 熔融：裂缝先出现，再变宽，最后连成岩浆海
   float melt  = smoothstep(620.0, 900.0, uTempLag.w);
-  float ridge = 1.0 - abs(fbm3(n0 * 3.1)) * 1.7;
+  float rn    = fbm3(n0 * 3.1);
+  float ridge = 1.0 - abs(rn) * 1.7;
   // 指数随熔融程度下降：细缝 → 宽缝 → 连片。固定指数下岩浆从头到尾一样粗，
   // 只是越来越亮——那不是在熔化，是在调亮度。
   float cracks = pow(clamp(ridge, 0.0, 1.0), mix(11.0, 3.4, melt));
@@ -289,6 +351,22 @@ void main(){
   base = mix(base, magma * 0.30, melt);
   vec3 emissive = magma * cracks * melt * 3.2;      // >1 交给 bloom
 
+  // ── 地壳活动：熔融之前，热应力先把地壳撕开细缝；冰盖退走的地方另有一条通路。
+  // 冰卸载 → 上地壳回弹减压 → 减压熔融。冰岛在末次冰消后喷发速率高出今日
+  // 30~50 倍，持续千年以上；这里用「岩石圈通道比冰盖通道慢」来定位冰缘退到过
+  // 哪里：两条通道算出的冰量之差，就是刚刚卸载的那一圈。
+  float iceWas = iceAmount(uCrustT, lat, water, alt, nLow, nMid);
+  float freed  = clamp(iceWas - ice, 0.0, 1.0);
+  float rift   = clamp(smoothstep(455.0, 690.0, uTempLag.w) * (1.0 - melt) + freed * 0.55, 0.0, 1.0);
+  // 裂缝要另取一条窄得多的脊线。ridge 的系数 1.7 是给岩浆海调的，宽得几乎处处为正，
+  // 再高的指数也压不住——同一个噪声值换个系数重算才对。
+  float fissure = pow(clamp(1.0 - abs(rn) * 10.0, 0.0, 1.0), 2.0);
+  // 火山活动是分省的，不是沿着每一条缝均匀开口；海面下也有，但看不到那么亮
+  fissure *= smoothstep(0.50, 0.86, nLow) * (1.0 - water * 0.62);
+  emissive += vec3(1.00, 0.30, 0.05) * fissure * rift * 3.6;
+
+  emissive += vec3(1.00, 0.34, 0.06) * fire * 3.0;
+
   float wet = water * (1.0 - dry) * (1.0 - ice);    // 当前仍是液态水的部分
 
   // ── 光照。网格不转，所以世界系法线可直接对太阳。
@@ -296,9 +374,13 @@ void main(){
   float ndl = dot(N, L);
   float day = smoothstep(-0.06, 0.14, ndl);
 
-  // 云影：沿光方向在 UV 上略偏移采样同一张云图
-  float cShadow = texture2D(uCloudTex, vec2(uv.x + 0.008, uv.y - 0.004)).r;
-  day *= 1.0 - smoothstep(0.30, 0.82, cShadow) * uCover * 0.42;
+  // 云影：沿光方向在 UV 上略偏移采样同一张云图。剪切项必须和云层用同一条
+  // 公式，否则影子会从云底下滑出去；形变与密度波那两层略去不算，
+  // 影子本来就是软的，为它再算几次噪声不划算。
+  float shadowU = uv.x + 0.022 * zonalWind(n0.y) * sin(uWind * 1.6) + 0.008;
+  float cShadow = texture2D(uCloudTex, vec2(shadowU, uv.y - 0.004)).r;
+  float coverHere = clamp(uCover * (1.0 + 0.30 * cloudBand(n0.y)), 0.0, 1.4);
+  day *= 1.0 - smoothstep(0.30, 0.82, cShadow) * coverHere * 0.42;
 
   // 终结线染色：掠射的光穿过更厚的大气，偏红
   vec3 warm = mix(vec3(1.0, 0.98, 0.95), vec3(1.0, 0.60, 0.34),
@@ -316,6 +398,9 @@ void main(){
   // ── 城市灯火：NASA 夜间灯光原图
   vec3 night = texture2D(uNight, uv).rgb;
   lit += night * pow(1.0 - day, 1.5) * uPop * 2.3 * (1.0 - ice * 0.85);
+
+  // 火线在夜面上才真正扎眼——卫星探火靠的就是这个热异常
+  lit += vec3(1.00, 0.30, 0.05) * fire * (1.0 - day) * 4.5;
 
   lit += emissive;
 
@@ -493,6 +578,7 @@ precision highp float;
 uniform sampler2D uCloudTex;
 uniform float uShatter;
 uniform float uSpinUV;
+uniform float uWind;
 uniform float uCover;
 uniform float uTint;
 uniform vec3  uLightDir;
@@ -500,16 +586,42 @@ varying vec2 vUv;
 varying vec3 vSurf;
 varying float vFlat;
 
+${NOISE}
+${WIND}
+
 void main(){
-  vec2 uv = vec2(vUv.x + uSpinUV, vUv.y);
+  vec3 n0 = normalize(vSurf);
+
+  // 贴图层只能做「整体自转 + 有界剪切」。无界剪切是做不得的：相邻纬度的 UV
+  // 会被越拉越远，采样器看到的导数爆掉，自动 mip 会直接选到几十像素宽的那一级，
+  // 整片云糊成灰。所以这里的剪切是缓慢往复的，不累积。
+  float shear = 0.022 * zonalWind(n0.y) * sin(uWind * 1.6);
+  // 形变场：位移幅度必须远小于它自己的特征尺度，否则不是平流，是把云图搅碎。
+  // 随时间演化比幅度大有用得多——第三维漂移，等于图样本身在生灭。
+  vec3 q = n0 * 3.2 + vec3(0.0, uWind * 0.55, 0.0);
+  vec2 warp = vec2(snoise(q), snoise(q + 31.7)) * 0.013;
+  vec2 uv = vec2(vUv.x + uSpinUV + shear + warp.x, vUv.y + warp.y * 0.5);
+
   float c = texture2D(uCloudTex, uv).r;
 
-  // uCover 推阈值（低气压时只剩最厚的云核），再整体缩放不透明度
-  float a = smoothstep(0.30 - uCover * 0.22, 0.74 - uCover * 0.22, c);
-  a *= clamp(uCover * 2.4, 0.0, 1.0);
+  // 真正无界流动的是这一层：一个程序化密度场，绕 Y 轴按纬向风带做真正的平流。
+  // 它是算出来的，没有 mip 可选，因此想转多远都不会糊。信风带与西风带方向相反，
+  // 于是能看见两股反向的密度波在各自的纬度里推进。
+  float ang = uWind * zonalWind(n0.y) * 6.2831853;
+  float ca = cos(ang), sa = sin(ang);
+  vec3  adv = vec3(n0.x * ca - n0.z * sa, n0.y, n0.x * sa + n0.z * ca);
+  float flow = fbm3(adv * 4.2 + vec3(0.0, uWind * 0.9, 0.0)) * 0.5 + 0.5;
+
+  // 云量分带：赤道辐合带最厚、副热带下沉支最薄、中纬风暴轴回升。
+  // 权重给小：这张云图是真实观测，本来就含这套气候态，加重会把带切得太硬。
+  float cover = clamp(uCover * (1.0 + 0.30 * cloudBand(n0.y)), 0.0, 1.4);
+
+  // cover 推阈值（低气压时只剩最厚的云核），再整体缩放不透明度
+  float a = smoothstep(0.30 - cover * 0.22, 0.74 - cover * 0.22, c);
+  a *= clamp(cover * 2.4, 0.0, 1.0);
+  a *= 0.62 + 0.98 * flow;          // 密度波：云在这里生，在那里消
   if(a < 0.012) discard;
 
-  vec3 n0 = normalize(vSurf);
   vec3 L  = normalize(uLightDir);
   float ndl = dot(n0, L);
   float day = smoothstep(-0.10, 0.18, ndl);
@@ -776,6 +888,7 @@ const TEX = {
    这一层是「这是个天体」和「这是个控件」的分界——零延迟的跟手感，
    比任何贴图问题都更快地暴露出它不是模拟。 */
 const ENV_TAU = {
+  crust: 8.0,   // 岩石圈：比冰盖还慢。它落后于冰盖的那一截就是「冰刚退走的地方」
   ice:   4.0,   // 冰盖：热容最大，最后一个反应过来
   sea:   2.6,   // 海洋：蒸干与封冻都慢
   veg:   1.8,   // 植被：荒漠化要几代人
@@ -787,6 +900,7 @@ const ENV_TAU = {
 // 帧率无关的指数逼近。朴素的 lerp(x, 0.1) 在 144Hz 上会抖、30Hz 上会黏，
 // 因为它是「每帧走剩余距离的 10%」而不是「每秒衰减到 1/e」。
 const damp = (cur, tgt, tau, dt) => cur + (tgt - cur) * (1 - Math.exp(-dt / tau));
+const clamp01 = v => Math.min(1, Math.max(0, v));
 
 /* ── 断裂图样 ──────────────────────────────────────────
    把球面上的三角面归进碎块。早先是一面一片：两万个同样大小的三角，
@@ -842,6 +956,7 @@ export class PlanetStage {
   constructor(canvas){
     this.canvas = canvas;
     this.spin = 0;
+    this.wind = 0;
     this.state = 'idle';       // idle | foil | crush | done
     this.effectT = 0;
     this.driftT = 0;
@@ -855,8 +970,9 @@ export class PlanetStage {
 
     // 环境：tgt 是滑块要求的，cur 是各子系统实际达到的
     this.tgt = { temp:288, cover:0.5, ctint:0, density:0.85, tr:1, tg:1, tb:1 };
-    this.cur = { ice:288, sea:288, veg:288, rock:288,
-                 cover:0.5, ctint:0, density:0.85, tr:1, tg:1, tb:1 };
+    this.cur = { ice:288, sea:288, veg:288, rock:288, crust:288,
+                 cover:0.5, ctint:0, density:0.85, tr:1, tg:1, tb:1,
+                 fire:0, burn:0 };
     this.warm = false;         // 首帧直接落到目标，免得开场几秒在「回暖」
 
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:false });
@@ -1089,7 +1205,8 @@ export class PlanetStage {
       uDay:{value:this.tex.day}, uNight:{value:this.tex.night},
       uSpec:{value:this.tex.spec}, uCloudTex:{value:this.tex.clouds},
       uTempLag:{value:new THREE.Vector4(288, 288, 288, 288)},
-      uPop:{value:1}, uSpinUV:{value:0}, uCover:{value:0.5},
+      uPop:{value:1}, uSpinUV:{value:0}, uCover:{value:0.5}, uWind:{value:0},
+      uCrustT:{value:288}, uFire:{value:0}, uBurn:{value:0},
       uLightDir:{value:this.lightDir},
       uFoilX:{value:-1.9}, uShatter:{value:0}, uSpread:{value:1},
       uFracWin:{value:new THREE.Vector2(0.15, 0.09)}, uBurstK:{value:1.0},
@@ -1138,7 +1255,7 @@ export class PlanetStage {
     const geo = new THREE.SphereGeometry(1.012, 96, 60);
     this.uCloud = {
       uCloudTex:{value:this.tex.clouds},
-      uSpinUV:{value:0}, uCover:{value:0.5}, uTint:{value:0},
+      uSpinUV:{value:0}, uWind:{value:0}, uCover:{value:0.5}, uTint:{value:0},
       uLightDir:{value:this.lightDir},
       uFoilX:{value:-1.9}, uShatter:{value:0}, uSpread:{value:1}
     };
@@ -1246,6 +1363,7 @@ export class PlanetStage {
   _dampEnv(dt){
     const t = this.tgt, c = this.cur;
     if(this.warm){
+      c.crust = damp(c.crust, t.temp, ENV_TAU.crust, dt);
       c.ice  = damp(c.ice,  t.temp, ENV_TAU.ice,  dt);
       c.sea  = damp(c.sea,  t.temp, ENV_TAU.sea,  dt);
       c.veg  = damp(c.veg,  t.temp, ENV_TAU.veg,  dt);
@@ -1257,17 +1375,31 @@ export class PlanetStage {
       c.tg = damp(c.tg, t.tg, ENV_TAU.air, dt);
       c.tb = damp(c.tb, t.tb, ENV_TAU.air, dt);
     }else{
-      Object.assign(c, { ice:t.temp, sea:t.temp, veg:t.temp, rock:t.temp,
+      Object.assign(c, { ice:t.temp, sea:t.temp, veg:t.temp, rock:t.temp, crust:t.temp,
                          cover:t.cover, ctint:t.ctint, density:t.density,
                          tr:t.tr, tg:t.tg, tb:t.tb });
       this.warm = true;
     }
 
+    /* 热冲击 = 目标温度与植被通道之间的落差。慢慢拧滑块它始终接近零，
+       猛地拉上去它会飙起来、再随慢通道追上而回落——这正是「生物圈跟不上」
+       的量化形式，不必另外记录变化率。火灾就挂在它上面。 */
+    const shock = clamp01((t.temp - c.veg) / 55);
+    const flam  = clamp01((t.temp - 300) / 45) * clamp01((525 - t.temp) / 70);
+    c.fire = damp(c.fire, shock * flam, 0.6, dt);
+    // 过火面积：烧的时候涨，之后随植被恢复缓慢褪去（τ 约 22 秒）
+    c.burn = Math.min(1, Math.max(0, c.burn + dt * (c.fire * 0.24 - c.burn * 0.045)));
+
     this.uPlanet.uTempLag.value.set(c.ice, c.veg, c.sea, c.rock);
     this.uPlanet.uCover.value = this.uCloud.uCover.value = c.cover;
     this.uCloud.uTint.value = c.ctint;
+    this.uPlanet.uCrustT.value = c.crust;
+    this.uPlanet.uFire.value = c.fire;
+    this.uPlanet.uBurn.value = c.burn;
     this.uAtmo.uDensity.value = c.density;
-    this.uAtmo.uTint.value.setRGB(c.tr, c.tg, c.tb);
+    // 烟尘气溶胶：大规模燃烧会把整层大气推向褐灰
+    const smoke = Math.min(0.55, c.fire * 1.1);
+    this.uAtmo.uTint.value.setRGB(c.tr + smoke * 0.34, c.tg - smoke * 0.10, c.tb - smoke * 0.28);
   }
 
   triggerFoil(){
@@ -1315,7 +1447,10 @@ export class PlanetStage {
     this.spin += edt * 0.055;
     const spinUV = this.spin / (Math.PI * 2);
     this.uPlanet.uSpinUV.value = spinUV;
-    this.uCloud.uSpinUV.value = spinUV * 1.18;   // 云走得比地表略快
+    this.uCloud.uSpinUV.value = spinUV;
+    // 云相对地面的位移交给纬向风带，不再是「整层比地表快 1.18 倍」那种刚体平移
+    this.wind += edt * 0.0125;
+    this.uPlanet.uWind.value = this.uCloud.uWind.value = this.wind;
 
     if(this.state === 'idle'){
       // 极慢的机位漂移。完全静止的机位是「粗糙」最容易被察觉的一处。
