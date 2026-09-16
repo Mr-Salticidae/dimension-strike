@@ -369,6 +369,31 @@ void main(){
 
   float wet = water * (1.0 - dry) * (1.0 - ice);    // 当前仍是液态水的部分
 
+  // ── 表面起伏。这一层是「整颗星在变」和「贴了一层图」的分界线：
+  // 只改反照率，光照对每种材质一视同仁，读起来必然是贴纸；改法线，明暗交界
+  // 处才会长出雪脊、沙丘和熔岩的坡面，材质才立得住。
+  vec3  Tg = normalize(cross(vec3(0.0, 1.0, 0.0), n0) + vec3(1e-4));
+  vec3  Bg = cross(n0, Tg);
+
+  // 基础地形直接对底图取梯度：那是真实影像，山脉走向本来就在里面，
+  // 比拿噪声凭空捏一层可信得多——噪声铺满大陆只会变成砂纸。
+  float eT = 0.0026;
+  float lu = dot(texture2D(uDay, uv + vec2(eT, 0.0)).rgb, vec3(0.299, 0.587, 0.114));
+  float lv = dot(texture2D(uDay, uv + vec2(0.0, eT)).rgb, vec3(0.299, 0.587, 0.114));
+  vec2  gTex = vec2(lu - relief, lv - relief) * (1.0 - water * (1.0 - dry)) * 7.0;
+
+  // 程序化那层只在材质真的换掉之后才出场：雪脊粗而缓，沙丘与熔岩坡细而密。
+  // 288K 的地球因此几乎只有底图自己的起伏，不会平白多一层噪点。
+  float procA = max(max(ice, arid * 0.70), melt * 0.85);
+  float bumpK = mix(20.0, 5.2, ice);
+  float eB = 0.030;
+  float hC = snoise(n0 * bumpK);
+  float hT = snoise((n0 + Tg * eB) * bumpK);
+  float hB = snoise((n0 + Bg * eB) * bumpK);
+  vec2  gPro = vec2(hT - hC, hB - hC) * procA * 0.28;
+
+  N = normalize(N - Tg * (gTex.x + gPro.x) - Bg * (gTex.y + gPro.y));
+
   // ── 光照。网格不转，所以世界系法线可直接对太阳。
   vec3 L = normalize(uLightDir);
   float ndl = dot(N, L);
@@ -389,11 +414,25 @@ void main(){
   vec3 lit = base * day * warm * 1.22;
   lit += base * vec3(0.034, 0.044, 0.066) * (1.0 - day);   // 夜面天光，别压死成纯黑
 
-  // ── 海洋太阳反射点
+  // ── 材质对光的反应。只有反照率不同的话，冰、沙、岩浆在光下是同一种东西，
+  // 那正是「贴了一层」的来源。下面三项让它们各自有各自的光学行为。
+
   vec3 V = normalize(cameraPosition - vPos);
   vec3 H = normalize(L + V);
+
+  // 水：极窄的镜面反射点
   float spec = pow(max(dot(N, H), 0.0), 1100.0) * wet * smoothstep(-0.02, 0.16, ndl);
   lit += vec3(1.0, 0.95, 0.86) * spec * 1.9;               // >1 交给 bloom
+
+  // 冰：镜面瓣宽得多，而且阴影是蓝的——冰体内多次散射把红端吃掉了，
+  // 这是雪地最好认的特征之一。它还会向四周散光，所以夜面不会压成全黑。
+  float iceSpec = pow(max(dot(N, H), 0.0), 46.0) * ice * smoothstep(-0.04, 0.20, ndl);
+  lit += vec3(0.80, 0.88, 1.00) * iceSpec * 0.85;
+  lit += vec3(0.055, 0.085, 0.150) * ice * (1.0 - day) * 1.15;
+
+  // 沙：粗糙表面的冲日效应——视线与光线接近时回散最强，沙漠因此在正午发白
+  float back = pow(max(dot(V, L), 0.0), 3.5) * arid * (1.0 - water) * day;
+  lit += vec3(0.42, 0.34, 0.22) * back * 0.55;
 
   // ── 城市灯火：NASA 夜间灯光原图
   vec3 night = texture2D(uNight, uv).rgb;
@@ -401,6 +440,12 @@ void main(){
 
   // 火线在夜面上才真正扎眼——卫星探火靠的就是这个热异常
   lit += vec3(1.00, 0.30, 0.05) * fire * (1.0 - day) * 4.5;
+
+  // ── 热辐射。约 650K 起可见暗红，900K 已经明显。这一项对日面夜面一视同仁：
+  // 温度一高，整个夜半球都会烧起来，而不是只有裂缝在亮——「整颗星在变」和
+  // 「贴了一层」的区别，最后就落在这种不分昼夜的项上。
+  float glowT = smoothstep(645.0, 1010.0, uTempLag.w);
+  lit += vec3(1.00, 0.22, 0.040) * pow(glowT, 2.3) * 1.8;
 
   lit += emissive;
 
@@ -1351,7 +1396,15 @@ export class PlanetStage {
     t.cover = Math.min(1, pc * (0.25 + 0.75 * tk) + steam * 0.55);
     t.ctint = Math.min(1, Math.max(0, (tempK - 340) / 260));
 
-    t.density = Math.min(2.2, Math.pow(pressureAtm / 1.2, 0.55) * 0.80);
+    // 大气不能只听气压。地表干了会起沙尘、海干了会腾蒸汽、冻透了气体会冻析到
+    // 地面——大气的厚度本来就是地表状态的一部分。少了这条耦合，地表怎么变，
+    // 边上那圈光晕都纹丝不动，「只改了一层」的观感有一半来自这里。
+    // 沙尘在荒漠温区达峰，熔融之前就该退掉——线性外推到八百度还满值，
+    // 会把整层大气顶成橙色泛光，把地表糊掉
+    const dust     = clamp01((tempK - 300) / 140) * clamp01((620 - tempK) / 140) * 0.45;
+    const condense = clamp01((248 - tempK) / 90) * 0.42;    // 低温 → 气体冻析到地表
+    t.density = Math.min(2.6, Math.pow(pressureAtm / 1.2, 0.55) * 0.80
+                              * (1 + dust + steam * 0.55) * (1 - condense));
     // 高温大气偏橙（尘与硫），低温偏青白
     const hot = Math.min(1, Math.max(0, (tempK - 320) / 320));
     const cold = Math.min(1, Math.max(0, (250 - tempK) / 130));
@@ -1396,9 +1449,9 @@ export class PlanetStage {
     this.uPlanet.uCrustT.value = c.crust;
     this.uPlanet.uFire.value = c.fire;
     this.uPlanet.uBurn.value = c.burn;
-    this.uAtmo.uDensity.value = c.density;
-    // 烟尘气溶胶：大规模燃烧会把整层大气推向褐灰
+    // 燃烧本身也加载气溶胶，让大气跟着变浑
     const smoke = Math.min(0.55, c.fire * 1.1);
+    this.uAtmo.uDensity.value = c.density * (1 + smoke * 0.45);
     this.uAtmo.uTint.value.setRGB(c.tr + smoke * 0.34, c.tg - smoke * 0.10, c.tb - smoke * 0.28);
   }
 
