@@ -1,4 +1,4 @@
-// 第 3,241 号文明 —— 状态演化与通讯记录
+// 被观测的文明 —— 状态演化与通讯记录
 //
 // 设计意图：读数保持临床式的冷静，文明的声音从中穿透出来。
 // 反差本身就是内容——你在无所谓地拖滑块，他们在里面经历纪元。
@@ -7,8 +7,32 @@ const IDEAL_T = 288;      // K
 const IDEAL_P = 1.0;      // atm
 const POP_BASE = 78.4;    // 亿
 
+/* 样本编号从 3,241 往上走。每换一个就跳过几个号，那几个号不属于你就不会出现。
+   生物型和纪元一律不变：对观测者而言它们本来就是可互换的，这比逐个编背景更冷。 */
+const CATALOGS = ['GLIESE', 'KEPLER', 'WOLF', 'ROSS', 'TRAPPIST', 'LHS', 'HD'];
+const NUMERALS = ['II', 'III', 'IV', 'V', 'VI'];
+
+function designation(){
+  const cat = CATALOGS[(Math.random() * CATALOGS.length) | 0];
+  const num = 100 + ((Math.random() * 900) | 0);
+  return `${cat} ${num} / ${NUMERALS[(Math.random() * NUMERALS.length) | 0]}`;
+}
+
 export class Civilization {
-  constructor(){ this.reset(); }
+  constructor(){
+    this.id = 3241;
+    this.tag = 'GLIESE 581 / IV';
+    this.reset();
+  }
+
+  /** 下一个样本。编号只往上走——那是「你已经做过很多次」唯一的痕迹。 */
+  nextSpecimen(){
+    this.id += 7 + ((Math.random() * 34) | 0);
+    this.tag = designation();
+    this.reset();
+  }
+
+  get idText(){ return this.id.toLocaleString('en-US'); }
 
   reset(){
     this.pop = 1;
@@ -68,7 +92,7 @@ export class Civilization {
   }
 
   _check(T, P, prevPop, resist){
-    this._say('hello', '检测到窄带信号。第 3,241 号文明向未知观察者致意。');
+    this._say('hello', `检测到窄带信号。第 ${this.idText} 号文明向未知观察者致意。`);
 
     // ── 温度
     if(T > 302) this._say('warm', '行星均温上升 14 K。他们注意到了，归因于恒星活动周期。');
@@ -91,7 +115,7 @@ export class Civilization {
 
     // ── 人口节点
     if(this.pop < 0.52) this._say('p50', '人口减半。广播内容从问候变成了坐标。');
-    if(this.pop < 0.21) this._say('p20', '第 3,241 号文明请求对话。任何形式的对话。');
+    if(this.pop < 0.21) this._say('p20', `第 ${this.idText} 号文明请求对话。任何形式的对话。`);
     if(this.pop < 0.06) this._say('p05', '广播功率衰减至背景噪声水平。');
     if(this.pop <= 0 && prevPop > 0){
       this.dead = true;
@@ -117,9 +141,12 @@ export class Civilization {
   }
 
   verdict(){
-    return this.struck === 'foil'
-      ? '跌落到二维的过程持续了 1,341 年。\n从他们的视角看，宇宙只是慢慢变薄了。'
-      : '行星解体耗时 94 秒。\n第 3,241 号文明未能发出任何讯息。';
+    if(this.struck === 'foil')
+      return '跌落到二维的过程持续了 1,341 年。\n从他们的视角看，宇宙只是慢慢变薄了。';
+    if(this.struck === 'crush')
+      return `行星解体耗时 94 秒。\n第 ${this.idText} 号文明未能发出任何讯息。`;
+    // 不动手也能结束——参数拧到那里，他们自己就走完了
+    return `没有动用任何武器。\n第 ${this.idText} 号文明，观测结束。`;
   }
 
   /** 取出待播报的消息并清空队列 */

@@ -27,13 +27,24 @@ const WANTED = { Closed_Fist:'fist', Open_Palm:'palm' };
 const MIN_SCORE = 0.62;
 const HOLD_FRAMES = 6;     // 约 0.2 秒，防抖
 
+/* 拨动：手在画面里移动多少，折算成多少「像素」交给舞台，用的是和鼠标同一条通路。
+   0.5 个归一化单位（半个画面）约合 350px，也就是两个多弧度——一次挥手拨小半圈。
+   x 要取反：预览用 scaleX(-1) 做了镜像，而关键点是原始图像坐标，不反过来
+   手往右挥星球会往左转。 */
+const DRAG_PX_X = -700, DRAG_PX_Y = 500;
+const PALM_SMOOTH = 0.35;   // 关键点抖得厉害，差分前必须低通，否则星球自己会发抖
+const DEAD_ZONE = 0.0015;   // 低于这个位移当作静止，免得握着不动也在慢慢转
+
 export class GestureInput {
-  constructor({ video, canvas, onGesture, onState }){
+  constructor({ video, canvas, onGesture, onState, onDrag }){
     this.video = video;
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
     this.onGesture = onGesture;
     this.onState = onState || (() => {});
+    this.onDrag = onDrag || (() => {});
+    this.palm = null;        // 低通后的掌心位置
+    this.dragging = false;
 
     this.rec = null;
     this.stream = null;
@@ -88,6 +99,7 @@ export class GestureInput {
     this.video.srcObject = null;
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
     this.held = null; this.heldCount = 0; this.armed = true;
+    this._endDrag();
     this.onState('未启用');
   }
 
@@ -105,11 +117,20 @@ export class GestureInput {
 
     this._draw(res?.landmarks?.[0]);
 
+    const lm = res?.landmarks?.[0];
     const top = res?.gestures?.[0]?.[0];
     const g = (top && top.score >= MIN_SCORE && WANTED[top.categoryName]) || null;
 
     if(g === this.held){ this.heldCount++; }
     else { this.held = g; this.heldCount = 1; }
+
+    // 握拳和摊掌是武器，其余一切姿势都是「拨」：手在那儿、又没在下令，
+    // 那就是在推这颗星球。不给它单独指定一个手势，是为了不用先学会什么。
+    if(lm && !g){
+      this._drag(lm);
+      return;
+    }
+    this._endDrag();
 
     if(!g){
       this.armed = true;
@@ -128,6 +149,36 @@ export class GestureInput {
       this.armed = false;
       this.onGesture(g);
     }
+  }
+
+  /* 掌心取腕点与四个掌指关节的平均：比任何单点都稳，手指乱动也不会带偏。 */
+  _drag(lm){
+    let cx = 0, cy = 0;
+    for(const i of [0, 5, 9, 13, 17]){ cx += lm[i].x; cy += lm[i].y; }
+    cx /= 5; cy /= 5;
+
+    if(!this.palm){
+      this.palm = { x:cx, y:cy };
+      this.dragging = true;
+      this.onDrag('start');
+      this.onState('拨动', 'live');
+      return;
+    }
+
+    const px = this.palm.x, py = this.palm.y;
+    this.palm.x += (cx - px) * PALM_SMOOTH;
+    this.palm.y += (cy - py) * PALM_SMOOTH;
+
+    const dx = this.palm.x - px, dy = this.palm.y - py;
+    if(Math.abs(dx) > DEAD_ZONE || Math.abs(dy) > DEAD_ZONE){
+      this.onDrag('move', dx * DRAG_PX_X, dy * DRAG_PX_Y);
+    }
+    this.onState('拨动', 'live');
+  }
+
+  _endDrag(){
+    this.palm = null;
+    if(this.dragging){ this.dragging = false; this.onDrag('end'); }
   }
 
   _draw(lm){

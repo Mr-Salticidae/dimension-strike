@@ -12,7 +12,8 @@ const el = {
   hab:$('habOut'), habBar:$('habBar'), log:$('log'),
   crush:$('crush'), foil:$('foil'), flash:$('flash'),
   verdict:$('verdict'), verdictText:$('verdictText'),
-  cam:$('cam'), camBtn:$('camBtn'), video:$('video'), hand:$('hand'), gestState:$('gestState')
+  cam:$('cam'), camBtn:$('camBtn'), video:$('video'), hand:$('hand'), gestState:$('gestState'),
+  again:$('again'), specId:$('specId'), specTag:$('specTag')
 };
 
 const stage = new PlanetStage(el.stage);
@@ -90,11 +91,31 @@ stage.onShock = () => {
   );
 };
 
-stage.onEffectEnd = () => {
+function showVerdict(){
+  if(el.verdict.classList.contains('is-on')) return;
   el.verdictText.textContent = civ.verdict();
   el.verdict.classList.add('is-on');
   el.verdict.setAttribute('aria-hidden', 'false');
-};
+}
+stage.onEffectEnd = showVerdict;
+
+/* ── 重玩：换下一个样本 ──
+   编号只往上走，其余一律不变——对观测者而言它们本来就是可互换的。
+   这比「重新开始」更贴这个设定：你不是在重来，你是在处理下一个。 */
+function newSpecimen(){
+  civ.nextSpecimen();
+  stage.reset();
+  year = 0; shownAmber = -1;
+  el.log.replaceChildren();
+  el.crush.disabled = el.foil.disabled = false;
+  el.verdict.classList.remove('is-on');
+  el.verdict.setAttribute('aria-hidden', 'true');
+  el.specId.textContent = civ.idText;
+  el.specTag.textContent = civ.tag;
+  el.temp.value = 288; el.pres.value = 50;
+  readControls();
+}
+el.again.addEventListener('click', newSpecimen);
 
 el.crush.addEventListener('click', () => fire('crush'));
 el.foil.addEventListener('click', () => fire('foil'));
@@ -154,7 +175,15 @@ async function ensureGesture(){
     video: el.video,
     canvas: el.hand,
     onGesture: g => fire(g === 'fist' ? 'crush' : 'foil'),
-    onState: setGestState
+    onState: setGestState,
+    // 手势拨动走和鼠标完全相同的那条通路，惯性、封顶、打击期禁用一并继承。
+    // 指针优先：真有人在拖的时候，别让摄像头和他抢同一颗星球。
+    onDrag: (kind, dx, dy) => {
+      if(dragId !== null) return;
+      if(kind === 'start') stage.grab();
+      else if(kind === 'move') stage.dragBy(dx, dy);
+      else stage.release();
+    }
   });
   return gesture;
 }
@@ -208,6 +237,9 @@ function frame(now){
 
   paintLife(civ.struck ? 0 : civ.pop);
   for(const m of civ.drain()) pushLog(m);
+
+  // 不动手也能把他们耗光。那条路径原先没有结局也没有出口，只剩一颗空行星。
+  if(civ.dead && !civ.struck) showVerdict();
 }
 requestAnimationFrame(frame);
 

@@ -192,6 +192,11 @@ body{
   background:radial-gradient(ellipse 58% 34% at 50% 50%, rgba(3,5,8,.90) 18%, rgba(3,5,8,.55) 55%, transparent 78%);
 }
 .verdict.is-on{opacity:1}
+/* 判词整体不吃指针，只有出口那颗按钮吃——别让整块遮罩挡住下面的星球 */
+.verdict-box{display:flex; flex-direction:column; align-items:center; gap:26px}
+.verdict.is-on #again{pointer-events:auto}
+#again{opacity:.72; transition:opacity .3s ease}
+#again:hover{opacity:1}
 .verdict p{
   margin:0; max-width:30ch; text-align:center; font-size:clamp(15px,2.3vw,20px);
   line-height:2.1; letter-spacing:.1em; color:var(--ink);

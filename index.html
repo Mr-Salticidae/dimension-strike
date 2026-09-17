@@ -41,8 +41,8 @@
   <h2 class="panel-title">目标监测<span class="panel-tag" id="statusTag">OBSERVING</span></h2>
 
   <div class="target">
-    <div class="target-id">第 <span class="num">3,241</span> 号文明</div>
-    <div class="target-sub">GLIESE&nbsp;581&nbsp;/&nbsp;IV&nbsp;· 碳基 · 已进入行星际时代</div>
+    <div class="target-id">第 <span id="specId" class="num">3,241</span> 号文明</div>
+    <div class="target-sub"><span id="specTag">GLIESE&nbsp;581&nbsp;/&nbsp;IV</span>&nbsp;· 碳基 · 已进入行星际时代</div>
   </div>
 
   <dl class="readout">
@@ -78,13 +78,18 @@
   <div class="cam-body">
     <video id="video" playsinline muted></video>
     <canvas id="hand"></canvas>
-    <div id="camHint" class="cam-hint">开启摄像头后<br>握拳或摊开手掌即可发动</div>
+    <div id="camHint" class="cam-hint">开启摄像头后<br>握拳或摊开手掌即可发动<br>其余手势可拨动星球</div>
   </div>
   <button id="camBtn" class="btn btn-ghost btn-sm" type="button">开启摄像头</button>
 </section>
 
 <div id="flash" class="flash" aria-hidden="true"></div>
-<div id="verdict" class="verdict" aria-hidden="true"><p id="verdictText"></p></div>
+<div id="verdict" class="verdict" aria-hidden="true">
+  <div class="verdict-box">
+    <p id="verdictText"></p>
+    <button id="again" class="btn btn-ghost" type="button">下一个样本</button>
+  </div>
+</div>
 
 <script type="importmap">
 { "imports": { "three": "./vendor/three.module.js" } }
