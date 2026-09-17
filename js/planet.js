@@ -988,6 +988,12 @@ function fractureCell(x, y, z){
    就是那一下，匀速滑过去等于没发生。 */
 const STOP_HOLD = 0.13, STOP_RAMP = 0.24;
 
+/* 观测者相对行星的倾角（弧度）。行星自转轴是世界 Y，若相机的 up 也取世界 Y，
+   纬度带、自转方向、两极就全部与屏幕轴对齐——那会读成「一颗贴了滚动贴图的球」，
+   而不是空间里一个有自己朝向的天体。给 up 一个倾角相当于给它一个黄赤交角
+   （地球是 23.4°）。不动网格：「网格永不旋转」是二向箔的前提。 */
+const CAM_TILT = 0.34;
+
 /* 一维值噪声。镜头抖动的位移必须连续：逐帧随机数抖成的是高频噪点，
    噪声场抖出来的才是晃动。 */
 const _hash1 = i => { const x = Math.sin(i * 127.1) * 43758.5453; return (x - Math.floor(x)) * 2 - 1; };
@@ -1007,6 +1013,9 @@ export class PlanetStage {
     this.driftT = 0;
     this.onEffectEnd = null;
     this.onShock = null;       // 断裂那一帧回调，供 HUD 同帧闪光
+
+    this.aimX = 0; this.aimY = 0;   // 视轴的偏置，不让行星钉死在正中
+    this.roll = CAM_TILT;
 
     this.trauma = 0;           // 0..1，实际位移取其平方
     this.shakeT = 0;
@@ -1097,36 +1106,67 @@ export class PlanetStage {
     }
   }
 
+  /* — 星空。均匀随机的单色点会读成一块平面背景板，行星就成了浮在它前面的
+       贴片。两件事让它变成「一个有纵深的地方」：恒星按光谱类型分色（蓝白到
+       橙红），以及把一部分密度压向一条倾斜的银道带。 — */
   _buildStars(){
-    const N = 2600, pos = new Float32Array(N * 3), sz = new Float32Array(N);
+    const N = 3400;
+    const pos = new Float32Array(N * 3), sz = new Float32Array(N), tmp = new Float32Array(N);
+    // 银道面的法线，与视轴和行星自转轴都错开，免得又出现一条与屏幕对齐的线
+    const gn = new THREE.Vector3(0.36, 0.82, -0.44).normalize();
+    const ga = new THREE.Vector3().crossVectors(gn, new THREE.Vector3(0, 1, 0)).normalize();
+    const gb = new THREE.Vector3().crossVectors(gn, ga);
+
     for(let i = 0; i < N; i++){
-      const u = Math.random() * 2 - 1, th = Math.random() * Math.PI * 2;
-      const r = 42 + Math.random() * 14, s = Math.sqrt(1 - u * u);
-      pos[i*3] = r * s * Math.cos(th);
-      pos[i*3+1] = r * u;
-      pos[i*3+2] = r * s * Math.sin(th);
-      sz[i] = Math.random() < 0.06 ? 0.30 : 0.055 + Math.random() * 0.10;
+      let x, y, z;
+      if(i % 5 === 0){
+        // 银道带：沿面内均匀、法向按高斯收窄
+        const th = Math.random() * Math.PI * 2;
+        const h = (Math.random() + Math.random() + Math.random() - 1.5) * 0.17;
+        const c = Math.cos(th), s2 = Math.sin(th);
+        x = ga.x * c + gb.x * s2 + gn.x * h;
+        y = ga.y * c + gb.y * s2 + gn.y * h;
+        z = ga.z * c + gb.z * s2 + gn.z * h;
+        const L = Math.hypot(x, y, z) || 1;
+        x /= L; y /= L; z /= L;
+      }else{
+        const u = Math.random() * 2 - 1, th = Math.random() * Math.PI * 2;
+        const s2 = Math.sqrt(1 - u * u);
+        x = s2 * Math.cos(th); y = u; z = s2 * Math.sin(th);
+      }
+      const r = 42 + Math.random() * 14;
+      pos[i*3] = x * r; pos[i*3+1] = y * r; pos[i*3+2] = z * r;
+      sz[i] = Math.random() < 0.05 ? 0.30 : 0.045 + Math.random() * 0.095;
+      // 偏向中段、少量走到两端：真实星场大多是白黄，蓝巨星和红矮星才是点缀
+      tmp[i] = Math.min(1, Math.max(0, (Math.random() + Math.random() + Math.random()) / 3
+                                        + (Math.random() - 0.5) * 0.55));
     }
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     g.setAttribute('aSize', new THREE.BufferAttribute(sz, 1));
+    g.setAttribute('aTemp', new THREE.BufferAttribute(tmp, 1));
     const m = new THREE.ShaderMaterial({
       transparent:true, depthWrite:false, blending:THREE.AdditiveBlending,
       vertexShader:`
-        attribute float aSize; varying float vA;
+        attribute float aSize; attribute float aTemp;
+        varying float vA; varying float vT;
         void main(){
-          vA = aSize;
+          vA = aSize; vT = aTemp;
           vec4 mv = modelViewMatrix * vec4(position, 1.0);
           gl_PointSize = aSize * 300.0 / -mv.z;
           gl_Position = projectionMatrix * mv;
         }`,
       fragmentShader:`
-        varying float vA;
+        varying float vA; varying float vT;
         void main(){
           float d = length(gl_PointCoord - 0.5);
           if(d > 0.5) discard;
+          // 光谱序列：橙红 → 白 → 蓝白
+          vec3 col = vT < 0.5
+            ? mix(vec3(1.00, 0.74, 0.55), vec3(1.00, 0.97, 0.92), vT * 2.0)
+            : mix(vec3(1.00, 0.97, 0.92), vec3(0.74, 0.83, 1.00), (vT - 0.5) * 2.0);
           float a = (1.0 - d * 2.0) * clamp(vA * 6.0, 0.15, 0.95);
-          gl_FragColor = vec4(vec3(0.85, 0.90, 1.0), a);
+          gl_FragColor = vec4(col, a);
         }`
     });
     this.stars = new THREE.Points(g, m);
@@ -1374,7 +1414,10 @@ export class PlanetStage {
       r * Math.sin(e),
       r * Math.cos(a) * Math.cos(e)
     );
-    this.camera.lookAt(0, 0, 0);
+    this.camera.up.set(Math.sin(this.roll), Math.cos(this.roll), 0);
+    // 视轴不锁死在球心。把主体钉在正中央是「浮在画面上」最直接的来源——
+    // 没有任何真实机位能做到那件事。
+    this.camera.lookAt(this.aimX, this.aimY, 0);
   }
 
   /* ── 外部接口 ── */
@@ -1490,6 +1533,7 @@ export class PlanetStage {
     this.uPlanet.uCoreGlow.value = this.uMantle.uCoreGlow.value = 0;
     this.uCoreBody.uSquash.value = 0; this.uCoreBody.uHeat.value = 0.5;
     this.camAz = 0; this.camEl = 0; this.camPush = 0;
+    this.aimX = 0; this.aimY = 0; this.roll = CAM_TILT;
     this._applyCam();
   }
 
@@ -1506,10 +1550,17 @@ export class PlanetStage {
     this.uPlanet.uWind.value = this.uCloud.uWind.value = this.wind;
 
     if(this.state === 'idle'){
-      // 极慢的机位漂移。完全静止的机位是「粗糙」最容易被察觉的一处。
+      // 观测平台的漂移。原先是两条纯正弦，每约四十秒反向一次——那正是「浮在
+      // 水里」的运动学签名：没有方向、没有尽头、完美光滑。改成噪声场：它不周期，
+      // 方向能连续保持很久，读起来是被载着走而不是在原地上下晃。
       this.driftT += edt;
-      this.camAz = Math.sin(this.driftT * 0.074) * 0.085;
-      this.camEl = Math.sin(this.driftT * 0.053 + 1.7) * 0.062 + 0.045;
+      const d = this.driftT;
+      this.camAz = noise1(d * 0.021) * 0.17 + noise1(d * 0.079 + 11.0) * 0.030;
+      this.camEl = noise1(d * 0.017 + 41.0) * 0.115 + 0.055;
+      // 主体在画面里也要呼吸，连滚转一起漂
+      this.aimX = noise1(d * 0.013 + 63.0) * 0.105;
+      this.aimY = noise1(d * 0.011 + 87.0) * 0.080;
+      this.roll = CAM_TILT + noise1(d * 0.009 + 29.0) * 0.05;
     }
     else if(this.state === 'foil'){
       this.effectT += edt / 7.4;                    // 全程约 7.4 秒，缓慢不可抗
