@@ -29,7 +29,9 @@ body{
   font-family:var(--cjk); font-size:14px; line-height:1.55;
   overflow:hidden; -webkit-font-smoothing:antialiased;
 }
-#stage{position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none}
+/* grab 光标是「这东西可以拿起来转」唯一的预告，别省 */
+#stage{position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none; cursor:grab}
+#stage.is-grabbing{cursor:grabbing}
 
 #vignette{
   position:fixed; inset:0; pointer-events:none; z-index:1;

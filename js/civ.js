@@ -22,6 +22,7 @@ export class Civilization {
     this.minPop = 1;
     this.queue = [];
     this.elapsed = 0;
+    this.spun = 0;
   }
 
   /** 宜居指数：温度按线性尺度、气压按对数尺度各自衰减 */
@@ -32,9 +33,11 @@ export class Civilization {
     return t * p;
   }
 
-  update(dt, T, P){
+  update(dt, T, P, spinAnomaly){
     if(this.struck) return;
     this.elapsed += dt;
+    // 被外力拨动自转的累计量，单位是弧度。他们测得到昼夜，测不到那只手。
+    this.spun += dt * Math.min(8, spinAnomaly || 0);
     this.cooldown = Math.max(0, this.cooldown - dt);
 
     this.hab = Civilization.habitability(T, P);
@@ -94,6 +97,12 @@ export class Civilization {
       this.dead = true;
       this._say('gone', '……信号中断。', 'final');
     }
+
+    // ── 自转异常。这是整个模拟里唯一一处他们能「察觉到被干预」的地方：
+    // 温度和气压还能归因于恒星，天空以错误的速度移动却无法解释。
+    if(this.spun > 3.0)  this._say('spin1', '恒星日长度出现无法解释的偏移。所有历法重新校准。');
+    if(this.spun > 13)   this._say('spin2', '天空正以错误的速度移动。有人提出「被观测」假说。');
+    if(this.spun > 34)   this._say('spin3', '昼夜节律崩溃。他们给那只看不见的手起了名字。');
 
     // ── 恢复（奖励把参数调回来的人）
     if(this.minPop < 0.32 && this.pop > 0.72 && !this.dead)

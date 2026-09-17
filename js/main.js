@@ -99,6 +99,34 @@ stage.onEffectEnd = () => {
 el.crush.addEventListener('click', () => fire('crush'));
 el.foil.addEventListener('click', () => fire('foil'));
 
+/* ── 操控：像转地球仪一样转它 ──
+   指针事件只挂在画布上，HUD 面板是它上层的独立元素，落在面板上的按下不会到这儿来。
+   用 pointer 事件而不是 mouse/touch 两套：一套代码同时吃鼠标、触摸和手写笔。 */
+let dragId = null, lastX = 0, lastY = 0;
+
+el.stage.addEventListener('pointerdown', ev => {
+  if(dragId !== null || !stage.grab()) return;
+  dragId = ev.pointerId;
+  lastX = ev.clientX; lastY = ev.clientY;
+  el.stage.setPointerCapture(dragId);   // 拖出画布外也不丢事件
+  el.stage.classList.add('is-grabbing');
+});
+
+el.stage.addEventListener('pointermove', ev => {
+  if(ev.pointerId !== dragId) return;
+  stage.dragBy(ev.clientX - lastX, ev.clientY - lastY);
+  lastX = ev.clientX; lastY = ev.clientY;
+});
+
+const endDrag = ev => {
+  if(ev.pointerId !== dragId) return;
+  stage.release();
+  el.stage.classList.remove('is-grabbing');
+  dragId = null;
+};
+el.stage.addEventListener('pointerup', endDrag);
+el.stage.addEventListener('pointercancel', endDrag);
+
 /* ── 复位 ── */
 el.reset.addEventListener('click', () => {
   el.temp.value = 288; el.pres.value = 50;
@@ -163,7 +191,7 @@ function frame(now){
 
   if(!civ.struck) year += dt * 47;     // 你拖一秒，他们过四十七年
 
-  civ.update(dt, T, P);
+  civ.update(dt, T, P, stage.spinAnomaly);
   stage.setEnv(T, P, civ.pop);
   stage.update(dt);
 

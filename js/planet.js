@@ -1012,6 +1012,19 @@ function fractureCell(x, y, z){
    就是那一下，匀速滑过去等于没发生。 */
 const STOP_HOLD = 0.13, STOP_RAMP = 0.24;
 
+/* ── 操控 ──────────────────────────────────────────────
+   像转地球仪一样转它。有一条硬约束：**行星网格永不旋转**（二向箔要沿固定的世界
+   平面压缩）。所以横向转动走地表 UV 偏移那条既有通路——转的是贴图与云，晨昏线和
+   纬度带留在原处，这恰好就是真实自转下该有的样子（太阳不会跟着转）。纵向则是抬降
+   机位，等于把地球仪扳过来看极区。 */
+const DRAG_SPIN = 0.0070;   // 弧度/像素（横向）
+const DRAG_TILT = 0.0055;   // 弧度/像素（纵向）
+const SPIN_TAU  = 2.1;      // 松手后的摩擦时间常数：地球仪会转很久，但终究停下
+const SPIN_VMAX = 3.2;      // 甩速上限。再快就成了陀螺，地表读不出来，也就谈不上「操控」
+const TILT_TAU  = 0.75;     // 倾角收得快些，否则会飘过头
+const TILT_MAX  = 1.02;     // 再高 up 与视轴就快平行了，lookAt 会退化
+const SPIN_BASE = 0.055;    // 基础自转角速度
+
 /* 观测者相对行星的倾角（弧度）。行星自转轴是世界 Y，若相机的 up 也取世界 Y，
    纬度带、自转方向、两极就全部与屏幕轴对齐——那会读成「一颗贴了滚动贴图的球」，
    而不是空间里一个有自己朝向的天体。给 up 一个倾角相当于给它一个黄赤交角
@@ -1040,6 +1053,12 @@ export class PlanetStage {
 
     this.aimX = 0; this.aimY = 0;   // 视轴的偏置，不让行星钉死在正中
     this.roll = CAM_TILT;
+
+    this.grabbed = false;           // 正被「抓住」：此时行星不自转，它在你手里
+    this.dragDX = 0; this.dragDY = 0;
+    this.spinVel = 0;               // 甩出去的角速度，松手后按摩擦衰减
+    this.tiltVel = 0;
+    this.userEl = 0;                // 手动扳出来的倾角，会一直保持在那儿
 
     this.trauma = 0;           // 0..1，实际位移取其平方
     this.shakeT = 0;
@@ -1558,6 +1577,8 @@ export class PlanetStage {
     this.uCoreBody.uSquash.value = 0; this.uCoreBody.uHeat.value = 0.5;
     this.camAz = 0; this.camEl = 0; this.camPush = 0;
     this.aimX = 0; this.aimY = 0; this.roll = CAM_TILT;
+    this.grabbed = false; this.dragDX = this.dragDY = 0;
+    this.spinVel = 0; this.tiltVel = 0; this.userEl = 0;
     this._applyCam();
   }
 
@@ -1565,7 +1586,8 @@ export class PlanetStage {
     const edt = this._timeScale(dt);   // 场景时间：命中停顿期间被压慢
     this._dampEnv(edt);
 
-    this.spin += edt * 0.055;
+    this._input(dt);                // 操控走真实时间：命中停顿不该让手感变黏
+    if(!this.grabbed) this.spin += edt * SPIN_BASE;
     const spinUV = this.spin / (Math.PI * 2);
     this.uPlanet.uSpinUV.value = spinUV;
     this.uCloud.uSpinUV.value = spinUV;
@@ -1582,7 +1604,8 @@ export class PlanetStage {
       this.driftT += edt;
       const d = this.driftT;
       this.camAz = noise1(d * 0.021) * 0.17 + noise1(d * 0.079 + 11.0) * 0.030;
-      this.camEl = noise1(d * 0.017 + 41.0) * 0.115 + 0.055;
+      this.camEl = Math.max(-TILT_MAX, Math.min(TILT_MAX,
+                    this.userEl + noise1(d * 0.017 + 41.0) * 0.115 + 0.055));
       // 主体在画面里也要呼吸，连滚转一起漂
       this.aimX = noise1(d * 0.013 + 63.0) * 0.105;
       this.aimY = noise1(d * 0.011 + 87.0) * 0.080;
@@ -1680,6 +1703,41 @@ export class PlanetStage {
     // 照亮碎片内侧的那道光，比内核本身收得快——碎片飞远后平方反比也会接管
     const g = this._ss(0.10, 0.26, e) * 1.10 - this._ss(0.38, 1.25, e) * 1.00;
     this.uPlanet.uCoreGlow.value = this.uMantle.uCoreGlow.value = Math.max(0, g);
+  }
+
+  /* ── 操控接口。指针事件在 main.js 里收，这里只管物理。 ── */
+
+  grab(){
+    if(this.state !== 'idle') return false;   // 打击进行中，镜头归编排管
+    this.grabbed = true;
+    this.spinVel = 0; this.tiltVel = 0;       // 重新抓住＝抓停它
+    return true;
+  }
+  dragBy(dx, dy){ if(this.grabbed){ this.dragDX += dx; this.dragDY += dy; } }
+  release(){ this.grabbed = false; }
+  // 人为附加的自转角速度（弧度/秒）。文明那边按时间积分它，得到「被拨动了多少弧度」。
+  get spinAnomaly(){ return Math.abs(this.spinVel); }
+
+  _input(dt){
+    const dx = this.dragDX, dy = this.dragDY;
+    this.dragDX = this.dragDY = 0;
+
+    if(this.grabbed){
+      this.spin  -= dx * DRAG_SPIN;
+      this.userEl = Math.max(-TILT_MAX, Math.min(TILT_MAX, this.userEl + dy * DRAG_TILT));
+      // 速度估计要平滑。单帧差分噪声太大，直接拿去当初速，松手那下会一顿。
+      const inv = 1 / Math.max(dt, 1e-3);
+      this.spinVel = damp(this.spinVel, -dx * DRAG_SPIN * inv, 0.055, dt);
+      this.tiltVel = damp(this.tiltVel,  dy * DRAG_TILT * inv, 0.055, dt);
+      this.spinVel = Math.max(-SPIN_VMAX, Math.min(SPIN_VMAX, this.spinVel));
+    }else{
+      this.spin  += dt * this.spinVel;
+      this.userEl = Math.max(-TILT_MAX, Math.min(TILT_MAX, this.userEl + dt * this.tiltVel));
+      this.spinVel *= Math.exp(-dt / SPIN_TAU);
+      this.tiltVel *= Math.exp(-dt / TILT_TAU);
+      // 扳到极限还留着动量的话，松手后会一直贴着边界抖
+      if(Math.abs(this.userEl) >= TILT_MAX - 1e-4) this.tiltVel = 0;
+    }
   }
 
   // 命中停顿。先几乎冻住，再放回，返回缩放后的时间步。
