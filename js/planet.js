@@ -89,6 +89,27 @@ float zonalWind(float s){          // s = sin(纬度)，带符号
   return trade + west + polar;
 }
 
+/* 三条风带的权重，以及各自的经向速度。
+   关键在于：偏移必须**按带取常数**，不能随纬度连续变化。常数偏移的 UV 导数为零，
+   所以想累积多远都不会糊；而连续变化的偏移会把相邻纬度的采样点越拉越远，导数爆掉，
+   自动 mip 直接把整片云糊成灰。带与带之间靠权重混合，那一圈正好读作风切变带里的
+   湍流混合区——物理上那里本来就是两股反向气流在搅。 */
+vec3 bandWeights(float s){
+  float a = abs(s);
+  float wT = 1.0 - smoothstep(0.38, 0.52, a);
+  float wW = smoothstep(0.40, 0.54, a) * (1.0 - smoothstep(0.80, 0.90, a));
+  float wP = smoothstep(0.82, 0.92, a);
+  return vec3(wT, wW, wP) / (wT + wW + wP + 1e-4);
+}
+
+// 信风带向西、西风带向东、极地东风再向西
+const vec3 BAND_SPEED = vec3(-0.60, 1.00, -0.32);
+
+vec3 rotY(vec3 v, float ang){
+  float c = cos(ang), s = sin(ang);
+  return vec3(v.x * c - v.z * s, v.y, v.x * s + v.z * c);
+}
+
 float cloudBand(float s){
   float a = abs(s);
   float itcz  =  1.00 * (1.0 - smoothstep(0.02, 0.26, abs(s - 0.10)));
@@ -399,11 +420,15 @@ void main(){
   float ndl = dot(N, L);
   float day = smoothstep(-0.06, 0.14, ndl);
 
-  // 云影：沿光方向在 UV 上略偏移采样同一张云图。剪切项必须和云层用同一条
-  // 公式，否则影子会从云底下滑出去；形变与密度波那两层略去不算，
-  // 影子本来就是软的，为它再算几次噪声不划算。
-  float shadowU = uv.x + 0.022 * zonalWind(n0.y) * sin(uWind * 1.6) + 0.008;
-  float cShadow = texture2D(uCloudTex, vec2(shadowU, uv.y - 0.004)).r;
+  // 云影：沿光方向在 UV 上略偏移采样同一张云图。**分带偏移必须和云层完全一致**，
+  // 否则影子会从云底下滑出去。生消那一层略去不算——影子本来就是软的，
+  // 为它再算三次噪声不划算。
+  vec3  wB = bandWeights(n0.y);
+  vec3  oB = BAND_SPEED * uWind;
+  vec2  sB = vec2(uv.x + 0.008, uv.y - 0.004);
+  float cShadow = wB.x * texture2D(uCloudTex, sB + vec2(oB.x, 0.0)).r
+                + wB.y * texture2D(uCloudTex, sB + vec2(oB.y, 0.0)).r
+                + wB.z * texture2D(uCloudTex, sB + vec2(oB.z, 0.0)).r;
   float coverHere = clamp(uCover * (1.0 + 0.30 * cloudBand(n0.y)), 0.0, 1.4);
   day *= 1.0 - smoothstep(0.30, 0.82, cShadow) * coverHere * 0.42;
 
@@ -637,25 +662,24 @@ ${WIND}
 void main(){
   vec3 n0 = normalize(vSurf);
 
-  // 贴图层只能做「整体自转 + 有界剪切」。无界剪切是做不得的：相邻纬度的 UV
-  // 会被越拉越远，采样器看到的导数爆掉，自动 mip 会直接选到几十像素宽的那一级，
-  // 整片云糊成灰。所以这里的剪切是缓慢往复的，不累积。
-  float shear = 0.022 * zonalWind(n0.y) * sin(uWind * 1.6);
-  // 形变场：位移幅度必须远小于它自己的特征尺度，否则不是平流，是把云图搅碎。
-  // 随时间演化比幅度大有用得多——第三维漂移，等于图样本身在生灭。
-  vec3 q = n0 * 3.2 + vec3(0.0, uWind * 0.55, 0.0);
-  vec2 warp = vec2(snoise(q), snoise(q + 31.7)) * 0.013;
-  vec2 uv = vec2(vUv.x + uSpinUV + shear + warp.x, vUv.y + warp.y * 0.5);
+  // 云是被风吹着走的，主运动是**平移**。之前为了绕开 mip 糊化，把平流换成了
+  // 「往复剪切 + 原地形变场」：往复让云来回滑，形变场让云团在原地扭——那不是在走，
+  // 那是程序化形变，一眼就能看出来。
+  // 正确的做法是按带取常数偏移：带内刚性平移（UV 导数为零，不糊，可以无界累积），
+  // 带间靠权重混合。见 bandWeights() 的注释。
+  vec3 w   = bandWeights(n0.y);
+  vec3 off = BAND_SPEED * uWind;
+  vec2 b   = vec2(vUv.x + uSpinUV, vUv.y);
+  float c = w.x * texture2D(uCloudTex, b + vec2(off.x, 0.0)).r
+          + w.y * texture2D(uCloudTex, b + vec2(off.y, 0.0)).r
+          + w.z * texture2D(uCloudTex, b + vec2(off.z, 0.0)).r;
 
-  float c = texture2D(uCloudTex, uv).r;
-
-  // 真正无界流动的是这一层：一个程序化密度场，绕 Y 轴按纬向风带做真正的平流。
-  // 它是算出来的，没有 mip 可选，因此想转多远都不会糊。信风带与西风带方向相反，
-  // 于是能看见两股反向的密度波在各自的纬度里推进。
-  float ang = uWind * zonalWind(n0.y) * 6.2831853;
-  float ca = cos(ang), sa = sin(ang);
-  vec3  adv = vec3(n0.x * ca - n0.z * sa, n0.y, n0.x * sa + n0.z * ca);
-  float flow = fbm3(adv * 4.2 + vec3(0.0, uWind * 0.9, 0.0)) * 0.5 + 0.5;
+  // 生消：同样按带做刚性平流。若让调制花纹不动而云在动，就会出现「不动的花纹
+  // 盖在走的云上」——那比没有生消更假。第三维随时间漂移，负责生与灭。
+  float tD = uWind * 12.0;   // 生消的节奏与平流解耦：风慢了，云团的寿命不该跟着变长
+  float flow = w.x * (snoise(rotY(n0, off.x * 6.2831853) * 3.6 + vec3(0.0, tD, 0.0)) * 0.5 + 0.5)
+             + w.y * (snoise(rotY(n0, off.y * 6.2831853) * 3.6 + vec3(0.0, tD, 0.0)) * 0.5 + 0.5)
+             + w.z * (snoise(rotY(n0, off.z * 6.2831853) * 3.6 + vec3(0.0, tD, 0.0)) * 0.5 + 0.5);
 
   // 云量分带：赤道辐合带最厚、副热带下沉支最薄、中纬风暴轴回升。
   // 权重给小：这张云图是真实观测，本来就含这套气候态，加重会把带切得太硬。
@@ -1545,8 +1569,10 @@ export class PlanetStage {
     const spinUV = this.spin / (Math.PI * 2);
     this.uPlanet.uSpinUV.value = spinUV;
     this.uCloud.uSpinUV.value = spinUV;
-    // 云相对地面的位移交给纬向风带，不再是「整层比地表快 1.18 倍」那种刚体平移
-    this.wind += edt * 0.0125;
+    // 云相对地面的位移交给纬向风带，不再是「整层比地表快 1.18 倍」那种刚体平移。
+    // 速率要压住：地表自转是 0.0088 UV/s，真实急流只有赤道自转线速的百分之几，
+    // 云跑得比行星转得还快会变成「云在抽」。这里取西风带绕行一圈约五分钟。
+    this.wind += edt * 0.0034;
     this.uPlanet.uWind.value = this.uCloud.uWind.value = this.wind;
 
     if(this.state === 'idle'){
